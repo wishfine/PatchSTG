@@ -162,7 +162,9 @@ python train_odps.py --config config/ODPS.conf --mode both
 
 #### Documentation
 
-- 📖 [ODPS Training Guide](ODPS_TRAINING_GUIDE.md) - Complete guide for using ODPS data
+- � [Server Deployment Guide](SERVER_DEPLOYMENT_GUIDE.md) - **从零开始在服务器上运行完整项目**
+- 📓 [Jupyter Notebooks Guide](JUPYTER_NOTEBOOKS_GUIDE.md) - **使用 Jupyter Notebook 进行交互式训练**
+- �📖 [ODPS Training Guide](ODPS_TRAINING_GUIDE.md) - Complete guide for using ODPS data
 - 📖 [Meta Table Guide](META_TABLE_GUIDE.md) - How to create metadata table for spatial patching
 - 📖 [Data Loader README](DATA_LOADER_README.md) - Data loading architecture
 
