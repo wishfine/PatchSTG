@@ -126,7 +126,13 @@ def construct_adj(data, num_node):
         # 如果数据不足一天，直接对所有时间步求平均
         data_mean = np.mean(data, axis=0)  # (nodes, 1) or (nodes,)
     else:
-        data_mean = np.mean([data[24*12*i: 24*12*(i+1)] for i in range(num_days)], axis=0)
+        # 先对每天内的时间步求平均，再对不同天求平均
+        daily_means = []
+        for i in range(num_days):
+            day_data = data[24*12*i: 24*12*(i+1)]  # (288, nodes, 1)
+            day_mean = np.mean(day_data, axis=0)   # (nodes, 1)
+            daily_means.append(day_mean)
+        data_mean = np.mean(daily_means, axis=0)   # (nodes, 1)
     
     # 确保形状为 (nodes, features)
     data_mean = data_mean.squeeze()  # 移除所有长度为1的维度
