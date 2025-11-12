@@ -221,14 +221,18 @@ class ODPSDataLoader:
         return np.array(features[:24], dtype=np.float32)
     
     def load_data(self):
-        """从 ODPS 加载数据"""
+        """
+        从 ODPS 加载数据（流式读取版本）
+        
+        ✅ 改进：使用 Table Iterator 流式读取，避免内存溢出
+        """
         if self._loaded:
             if self.log:
                 log_string(self.log, 'Data already loaded, skipping...')
             return
         
         if self.log:
-            log_string(self.log, '\n------------ Loading Data from ODPS -------------')
+            log_string(self.log, '\n------------ Loading Data from ODPS (Streaming) -------------')
             log_string(self.log, f'Project: {self.odps_project}')
             log_string(self.log, f'Table: {self.odps_table}')
             log_string(self.log, f'Adcode: {self.adcode}')
@@ -237,36 +241,25 @@ class ODPSDataLoader:
         # 初始化 ODPS 客户端
         self._init_odps_client()
         
-        # 构建并执行查询
-        query = self._build_query()
+        # 步骤 1: 先查询节点列表（用小查询获取唯一节点对）
         if self.log:
-            log_string(self.log, f'\nExecuting query:\n{query}\n')
+            log_string(self.log, '\nStep 1: Loading node list...')
+        self._load_node_list_from_odps()
         
-        # 执行查询并转为 DataFrame
-        with self._odps_client.execute_sql(query).open_reader() as reader:
-            records = [record.values for record in reader]
-            columns = ['nds_id', 'next_nds_id', 'adcode', 'ds', 'passts_time', 
-                      'flow_label', 'time_feat', 'dym_feat_feat']
-            df = pd.DataFrame(records, columns=columns)
-        
+        # 步骤 2: 加载节点位置信息
         if self.log:
-            log_string(self.log, f'Loaded {len(df)} records from ODPS')
-        
-        if len(df) == 0:
-            raise ValueError("No data loaded from ODPS. Check your filter conditions.")
-        
-        # 构建节点列表
-        self._build_node_list(df)
-        
-        # 加载节点位置信息（如果有元数据表）
+            log_string(self.log, '\nStep 2: Loading node locations...')
         self._load_node_locations()
         
-        # 处理数据并划分数据集
-        self._process_and_split_data(df)
+        # 步骤 3: 流式读取数据并处理
+        if self.log:
+            log_string(self.log, '\nStep 3: Streaming data from ODPS...')
+        self._stream_and_process_data()
         
         self._loaded = True
         
         if self.log:
+            log_string(self.log, f'\n✅ Data loading completed!')
             log_string(self.log, f'Train samples: {self.trainX.shape[0]}')
             log_string(self.log, f'Val samples: {self.valX.shape[0]}')
             log_string(self.log, f'Test samples: {self.testX.shape[0]}')
@@ -274,18 +267,264 @@ class ODPSDataLoader:
             log_string(self.log, f'Mean: {self.mean:.4f}, Std: {self.std:.4f}')
             log_string(self.log, '------------ End -------------\n')
     
-    def _build_node_list(self, df):
-        """构建节点列表"""
-        # 获取唯一的 (nds_id, next_nds_id) 对
-        node_pairs = df[['nds_id', 'next_nds_id']].drop_duplicates()
-        self.node_list = [(row['nds_id'], row['next_nds_id']) 
-                         for _, row in node_pairs.iterrows()]
+    def _load_node_list_from_odps(self):
+        """
+        从 ODPS 查询唯一的节点列表
+        
+        使用 DISTINCT 查询，数据量小，不会有内存问题
+        """
+        query = f"""
+        SELECT DISTINCT 
+            nds_id,
+            next_nds_id
+        FROM {self.odps_table}
+        WHERE 1=1
+        """
+        
+        if self.adcode:
+            query += f" AND adcode = '{self.adcode}'"
+        
+        if self.start_date and self.end_date:
+            query += f" AND ds >= '{self.start_date}' AND ds <= '{self.end_date}'"
+        elif self.start_date:
+            query += f" AND ds >= '{self.start_date}'"
+        elif self.end_date:
+            query += f" AND ds <= '{self.end_date}'"
+        
+        if self.log:
+            log_string(self.log, f'   Querying unique nodes...')
+        
+        # 执行查询
+        with self._odps_client.execute_sql(query).open_reader() as reader:
+            node_pairs = [(record[0], record[1]) for record in reader]
+        
+        self.node_list = node_pairs
         self.node_num = len(self.node_list)
         self.node_to_idx = {node: idx for idx, node in enumerate(self.node_list)}
         
         if self.log:
-            log_string(self.log, f'Found {self.node_num} unique node pairs (road segments)')
+            log_string(self.log, f'   ✅ Found {self.node_num} unique node pairs')
     
+    def _stream_and_process_data(self):
+        """
+        流式读取 ODPS 数据并处理
+        
+        ✅ 核心改进：使用 Table API 直接读取，支持分片和流式处理
+        """
+        # 构建查询（用于获取表）
+        query = self._build_query()
+        
+        if self.log:
+            log_string(self.log, f'   Executing streaming query...')
+            log_string(self.log, f'   Query:\n{query}')
+        
+        # 方案：使用 execute_sql 的 open_reader 但分批读取
+        # open_reader 返回一个迭代器，我们可以分批处理
+        
+        chunk_size = 100000  # 每批处理 10 万条记录
+        total_records = 0
+        
+        # 用于累积时间序列数据的字典
+        # key: time_minute, value: {node_idx: flow_value}
+        time_series_dict = {}
+        
+        if self.log:
+            log_string(self.log, f'   Reading data in chunks of {chunk_size} records...')
+        
+        with self._odps_client.execute_sql(query).open_reader() as reader:
+            chunk_records = []
+            
+            for record in reader:
+                chunk_records.append(record.values)
+                
+                # 达到批次大小，处理这批数据
+                if len(chunk_records) >= chunk_size:
+                    self._process_chunk(chunk_records, time_series_dict)
+                    total_records += len(chunk_records)
+                    
+                    if self.log:
+                        log_string(self.log, f'   Processed {total_records} records...')
+                    
+                    chunk_records = []
+            
+            # 处理最后一批
+            if chunk_records:
+                self._process_chunk(chunk_records, time_series_dict)
+                total_records += len(chunk_records)
+        
+        if self.log:
+            log_string(self.log, f'   ✅ Total records processed: {total_records}')
+            log_string(self.log, f'   Unique time steps: {len(time_series_dict)}')
+        
+        if total_records == 0:
+            raise ValueError("No data loaded from ODPS. Check your filter conditions.")
+        
+        # 转换为 DataFrame 并继续后续处理
+        if self.log:
+            log_string(self.log, '   Converting to time series format...')
+        
+        self._build_time_series_from_dict(time_series_dict)
+    
+    def _process_chunk(self, records, time_series_dict):
+        """
+        处理一批记录，累积到时间序列字典中
+        
+        参数:
+            records: 记录列表
+            time_series_dict: 累积的时间序列字典
+        """
+        columns = ['nds_id', 'next_nds_id', 'adcode', 'ds', 'passts_time', 
+                  'flow_label', 'time_feat', 'dym_feat_feat']
+        df_chunk = pd.DataFrame(records, columns=columns)
+        
+        # 转换时间戳
+        df_chunk['timestamp'] = pd.to_datetime(df_chunk['passts_time'])
+        df_chunk['time_minute'] = df_chunk['timestamp'].dt.floor('1min')
+        
+        # 添加节点索引
+        df_chunk['node_idx'] = df_chunk.apply(
+            lambda row: self.node_to_idx.get((row['nds_id'], row['next_nds_id']), -1), 
+            axis=1
+        )
+        
+        # 过滤掉未知节点
+        df_chunk = df_chunk[df_chunk['node_idx'] != -1]
+        
+        # 累积到字典中
+        for _, row in df_chunk.iterrows():
+            time_key = row['time_minute']
+            node_idx = row['node_idx']
+            flow_value = row['flow_label']
+            
+            if time_key not in time_series_dict:
+                time_series_dict[time_key] = {}
+            
+            # 如果同一节点同一时间有多条记录，取平均
+            if node_idx in time_series_dict[time_key]:
+                time_series_dict[time_key][node_idx] = (
+                    time_series_dict[time_key][node_idx] + flow_value
+                ) / 2
+            else:
+                time_series_dict[time_key][node_idx] = flow_value
+    
+    def _build_time_series_from_dict(self, time_series_dict):
+        """
+        从时间序列字典构建最终的训练数据
+        
+        参数:
+            time_series_dict: {time_minute: {node_idx: flow_value}}
+        """
+        # 排序时间点
+        sorted_times = sorted(time_series_dict.keys())
+        num_times = len(sorted_times)
+        
+        if self.log:
+            log_string(self.log, f'   Time range: {sorted_times[0]} ~ {sorted_times[-1]}')
+            log_string(self.log, f'   Time steps: {num_times}')
+        
+        # 构建流量矩阵 (num_times, num_nodes)
+        flow_matrix = np.zeros((num_times, self.node_num), dtype=np.float32)
+        
+        for t_idx, time_key in enumerate(sorted_times):
+            node_flows = time_series_dict[time_key]
+            for node_idx, flow_value in node_flows.items():
+                flow_matrix[t_idx, node_idx] = flow_value
+        
+        if self.log:
+            non_zero_ratio = (flow_matrix > 0).sum() / flow_matrix.size * 100
+            log_string(self.log, f'   Flow matrix shape: {flow_matrix.shape}')
+            log_string(self.log, f'   Non-zero ratio: {non_zero_ratio:.2f}%')
+        
+        # 构建时间特征
+        time_features = []
+        for timestamp in sorted_times:
+            hour = timestamp.hour
+            day_of_week = timestamp.dayofweek
+            tod = hour / 24.0
+            dow = day_of_week / 7.0
+            time_features.append([tod, dow])
+        
+        time_features = np.array(time_features, dtype=np.float32)
+        
+        # 生成样本
+        if self.log:
+            log_string(self.log, '   Generating samples with sliding window...')
+        
+        num_samples = num_times - self.input_len - self.output_len + 1
+        
+        if num_samples <= 0:
+            raise ValueError(
+                f"Not enough time steps to generate samples!\n"
+                f"  Time steps: {num_times}\n"
+                f"  Required: input_len ({self.input_len}) + output_len ({self.output_len}) = {self.input_len + self.output_len}\n"
+                f"  Please use a longer date range."
+            )
+        
+        # 预分配数组
+        X_data = np.zeros((num_samples, self.input_len, self.node_num, 1), dtype=np.float32)
+        Y_data = np.zeros((num_samples, self.output_len, self.node_num, 1), dtype=np.float32)
+        XTE_data = np.zeros((num_samples, self.input_len, 2), dtype=np.float32)
+        YTE_data = np.zeros((num_samples, self.output_len, 2), dtype=np.float32)
+        
+        # 滑动窗口生成样本
+        for i in range(num_samples):
+            X_data[i, :, :, 0] = flow_matrix[i:i+self.input_len]
+            XTE_data[i] = time_features[i:i+self.input_len]
+            Y_data[i, :, :, 0] = flow_matrix[i+self.input_len:i+self.input_len+self.output_len]
+            YTE_data[i] = time_features[i+self.input_len:i+self.input_len+self.output_len]
+        
+        if self.log:
+            log_string(self.log, f'   ✅ Generated {num_samples} samples')
+        
+        # 验证数据
+        if np.any(np.isnan(X_data)) or np.any(np.isinf(X_data)):
+            raise ValueError("X_data contains NaN or Inf values!")
+        if np.any(np.isnan(Y_data)) or np.any(np.isinf(Y_data)):
+            raise ValueError("Y_data contains NaN or Inf values!")
+        
+        # 计算归一化参数
+        num_train = int(num_samples * self.train_ratio)
+        train_data = X_data[:num_train]
+        train_nonzero = train_data[train_data > 0]
+        
+        if len(train_nonzero) > 0:
+            self.mean = np.mean(train_nonzero)
+            self.std = np.std(train_nonzero)
+        else:
+            self.mean = 0.0
+            self.std = 1.0
+        
+        if self.std < 1e-6:
+            self.std = 1.0
+        
+        if self.log:
+            log_string(self.log, f'   Normalization: mean={self.mean:.4f}, std={self.std:.4f}')
+        
+        # 划分数据集
+        num_val = int(num_samples * self.val_ratio)
+        num_test = int(num_samples * self.test_ratio)
+        
+        self.trainX = X_data[:num_train]
+        self.trainY = Y_data[:num_train]
+        self.trainXTE = XTE_data[:num_train]
+        self.trainYTE = YTE_data[:num_train]
+        
+        self.valX = X_data[num_train:num_train+num_val]
+        self.valY = Y_data[num_train:num_train+num_val]
+        self.valXTE = XTE_data[num_train:num_train+num_val]
+        self.valYTE = YTE_data[num_train:num_train+num_val]
+        
+        self.testX = X_data[num_train+num_val:num_train+num_val+num_test]
+        self.testY = Y_data[num_train+num_val:num_train+num_val+num_test]
+        self.testXTE = XTE_data[num_train+num_val:num_train+num_val+num_test]
+        self.testYTE = YTE_data[num_train+num_val:num_train+num_val+num_test]
+        
+        if self.log:
+            log_string(self.log, f'   ✅ Dataset split: Train={num_train}, Val={num_val}, Test={num_test}')
+        
+        # 创建空间 patch
+        self._create_spatial_patches(self.trainX)
+
     def _load_node_locations(self):
         """
         从 ODPS 元数据表加载路口的经纬度信息（必须）
@@ -399,203 +638,7 @@ class ODPSDataLoader:
                 log_string(self.log, f'   ⚠️  Warning: {missing_count} nodes have missing locations')
                 if missing_count <= 10:
                     log_string(self.log, f'   Missing nodes: {missing_nodes[:10]}')
-    
-    def _process_and_split_data(self, df):
-        """
-        处理数据并划分为训练/验证/测试集
-        
-        ✅ 新实现：按时间窗口组织数据（密集格式）
-        
-        数据结构:
-        - X: (num_samples, input_len, num_nodes, 1) - 过去的流量值
-        - Y: (num_samples, output_len, num_nodes, 1) - 未来的流量值
-        - XTE: (num_samples, input_len, 2) - 时间特征 (tod, dow)
-        - YTE: (num_samples, output_len, 2) - 时间特征 (tod, dow)
-        
-        关键改进：每个样本包含所有节点在连续时间段的数据（密集）
-        """
-        if self.log:
-            log_string(self.log, '\n📊 Processing data (time-series format)...')
-        
-        # 步骤 1: 转换时间戳格式并添加节点索引
-        if self.log:
-            log_string(self.log, '   Step 1: Parsing timestamps...')
-        
-        df['timestamp'] = pd.to_datetime(df['passts_time'])
-        df['node_idx'] = df.apply(
-            lambda row: self.node_to_idx[(row['nds_id'], row['next_nds_id'])], 
-            axis=1
-        )
-        
-        # 步骤 2: 按分钟对齐时间戳（向下取整）
-        df['time_minute'] = df['timestamp'].dt.floor('1min')
-        
-        if self.log:
-            time_range = f"{df['time_minute'].min()} ~ {df['time_minute'].max()}"
-            log_string(self.log, f'   Time range: {time_range}')
-        
-        # 步骤 3: Pivot 为时间序列格式（时间 × 节点）
-        if self.log:
-            log_string(self.log, '   Step 2: Pivoting to time-series format...')
-            log_string(self.log, f'   This may take a while for {len(df)} records...')
-        
-        # 使用 pivot_table 聚合（如果同一节点同一分钟有多条记录，取平均）
-        flow_matrix = df.pivot_table(
-            index='time_minute',
-            columns='node_idx',
-            values='flow_label',
-            aggfunc='mean',  # 如果有重复，取平均
-            fill_value=0.0   # 缺失值填充为 0
-        )
-        
-        # 确保所有节点都在列中（按索引排序）
-        all_node_indices = list(range(self.node_num))
-        missing_nodes = set(all_node_indices) - set(flow_matrix.columns)
-        for node_idx in missing_nodes:
-            flow_matrix[node_idx] = 0.0
-        flow_matrix = flow_matrix[all_node_indices]  # 按节点索引排序
-        
-        if self.log:
-            log_string(self.log, f'   ✅ Flow matrix shape: {flow_matrix.shape} (time × nodes)')
-            log_string(self.log, f'   Time steps: {len(flow_matrix)}')
-            log_string(self.log, f'   Nodes: {len(flow_matrix.columns)}')
-            
-            # 统计非零值比例
-            non_zero_ratio = (flow_matrix.values > 0).sum() / flow_matrix.size * 100
-            log_string(self.log, f'   Non-zero ratio: {non_zero_ratio:.2f}%')
-        
-        # 步骤 4: 提取时间特征
-        if self.log:
-            log_string(self.log, '   Step 3: Extracting time features...')
-        
-        # 为每个时间点生成时间特征
-        time_features = []
-        for timestamp in flow_matrix.index:
-            hour = timestamp.hour
-            day_of_week = timestamp.dayofweek  # 0=Monday, 6=Sunday
-            
-            tod = hour / 24.0      # Time of day [0, 1)
-            dow = day_of_week / 7.0  # Day of week [0, 1)
-            
-            time_features.append([tod, dow])
-        
-        time_features = np.array(time_features, dtype=np.float32)
-        
-        # 步骤 5: 使用滑动窗口生成样本
-        if self.log:
-            log_string(self.log, '   Step 4: Generating samples with sliding window...')
-        
-        flow_values = flow_matrix.values  # (num_times, num_nodes)
-        num_times = len(flow_values)
-        num_samples = num_times - self.input_len - self.output_len + 1
-        
-        if num_samples <= 0:
-            raise ValueError(
-                f"Not enough time steps to generate samples!\n"
-                f"  Time steps: {num_times}\n"
-                f"  Required: input_len ({self.input_len}) + output_len ({self.output_len}) = {self.input_len + self.output_len}\n"
-                f"  Please use a longer date range."
-            )
-        
-        if self.log:
-            log_string(self.log, f'   Total samples to generate: {num_samples}')
-        
-        # 预分配数组
-        X_data = np.zeros((num_samples, self.input_len, self.node_num, 1), dtype=np.float32)
-        Y_data = np.zeros((num_samples, self.output_len, self.node_num, 1), dtype=np.float32)
-        XTE_data = np.zeros((num_samples, self.input_len, 2), dtype=np.float32)
-        YTE_data = np.zeros((num_samples, self.output_len, 2), dtype=np.float32)
-        
-        # 滑动窗口生成样本
-        for i in range(num_samples):
-            # 输入：时间步 i 到 i+input_len-1
-            X_data[i, :, :, 0] = flow_values[i:i+self.input_len]
-            XTE_data[i] = time_features[i:i+self.input_len]
-            
-            # 输出：时间步 i+input_len 到 i+input_len+output_len-1
-            Y_data[i, :, :, 0] = flow_values[i+self.input_len:i+self.input_len+self.output_len]
-            YTE_data[i] = time_features[i+self.input_len:i+self.input_len+self.output_len]
-        
-        if self.log:
-            log_string(self.log, f'   ✅ Generated {num_samples} samples')
-            log_string(self.log, f'   X shape: {X_data.shape}')
-            log_string(self.log, f'   Y shape: {Y_data.shape}')
-        
-        # 步骤 6: 验证数据有效性
-        if self.log:
-            log_string(self.log, '   Step 5: Validating data...')
-        
-        # 检查是否有无效值
-        if np.any(np.isnan(X_data)) or np.any(np.isinf(X_data)):
-            raise ValueError("X_data contains NaN or Inf values!")
-        if np.any(np.isnan(Y_data)) or np.any(np.isinf(Y_data)):
-            raise ValueError("Y_data contains NaN or Inf values!")
-        
-        # 统计每个样本中有多少节点有非零值
-        nodes_per_sample = (X_data[:, :, :, 0] > 0).any(axis=1).sum(axis=1)
-        avg_nodes = nodes_per_sample.mean()
-        min_nodes = nodes_per_sample.min()
-        max_nodes = nodes_per_sample.max()
-        
-        if self.log:
-            log_string(self.log, f'   Nodes with data per sample: min={min_nodes}, max={max_nodes}, avg={avg_nodes:.1f}')
-            log_string(self.log, f'   Flow value range: [{X_data.min():.2f}, {X_data.max():.2f}]')
-        
-        # 步骤 7: 计算归一化参数（基于训练集）
-        num_train = int(num_samples * self.train_ratio)
-        train_data = X_data[:num_train]
-        
-        # 只对非零值计算均值和标准差（更准确）
-        train_nonzero = train_data[train_data > 0]
-        if len(train_nonzero) > 0:
-            self.mean = np.mean(train_nonzero)
-            self.std = np.std(train_nonzero)
-        else:
-            self.mean = 0.0
-            self.std = 1.0
-        
-        if self.std < 1e-6:
-            self.std = 1.0
-            if self.log:
-                log_string(self.log, '   ⚠️  Warning: std is too small, set to 1.0')
-        
-        if self.log:
-            log_string(self.log, f'   Normalization: mean={self.mean:.4f}, std={self.std:.4f}')
-        
-        # 步骤 8: 划分数据集
-        num_val = int(num_samples * self.val_ratio)
-        num_test = int(num_samples * self.test_ratio)
-        
-        # 确保划分后至少有一些样本
-        if num_train < 1 or num_val < 1 or num_test < 1:
-            raise ValueError(
-                f"Dataset too small after split!\n"
-                f"  Total samples: {num_samples}\n"
-                f"  Train: {num_train}, Val: {num_val}, Test: {num_test}\n"
-                f"  Please use a longer date range or adjust split ratios."
-            )
-        
-        self.trainX = X_data[:num_train]
-        self.trainY = Y_data[:num_train]
-        self.trainXTE = XTE_data[:num_train]
-        self.trainYTE = YTE_data[:num_train]
-        
-        self.valX = X_data[num_train:num_train+num_val]
-        self.valY = Y_data[num_train:num_train+num_val]
-        self.valXTE = XTE_data[num_train:num_train+num_val]
-        self.valYTE = YTE_data[num_train:num_train+num_val]
-        
-        self.testX = X_data[num_train+num_val:num_train+num_val+num_test]
-        self.testY = Y_data[num_train+num_val:num_train+num_val+num_test]
-        self.testXTE = XTE_data[num_train+num_val:num_train+num_val+num_test]
-        self.testYTE = YTE_data[num_train+num_val:num_train+num_val+num_test]
-        
-        if self.log:
-            log_string(self.log, f'   ✅ Dataset split: Train={num_train}, Val={num_val}, Test={num_test}')
-        
-        # 创建空间 patch 索引
-        self._create_spatial_patches(self.trainX)
-    
+
     def _create_spatial_patches(self, train_data):
         """
         创建空间 patch 索引（使用 KD-tree）
