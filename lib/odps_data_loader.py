@@ -657,7 +657,10 @@ class ODPSDataLoader:
             # 构造邻接矩阵用于补齐
             if self.log:
                 log_string(self.log, '   Constructing adjacency matrix...')
-            adj = construct_adj(train_data, self.node_num)
+            # construct_adj 期望 (time_steps, nodes, 1)，但 train_data 是 (samples, time_steps, nodes, 1)
+            # 我们将所有样本拼接成一个长时间序列
+            train_data_concat = train_data.reshape(-1, self.node_num, 1)  # (samples*time_steps, nodes, 1)
+            adj = construct_adj(train_data_concat, self.node_num)
             
             # 获取最大 patch 长度
             mxlen = max([len(p) for p in parts_idx])

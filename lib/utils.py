@@ -115,13 +115,32 @@ def construct_adj(data, num_node):
     基于余弦相似度构造节点相似度矩阵（用于补齐 patch 时选择相似点）。
     方法：把时间序列按每天（24 小时 * 12 个采样点/小时）分块求均值，
     然后对所有节点间的均值向量计算 cosine similarity，最后做指数尺度变换以扩大差异。
+    
+    参数:
+        data: shape (time_steps, nodes, 1) or (time_steps, nodes)
+        num_node: 节点数量
     """
     # 按天切片并求均值，data.shape[0] 应为时间步数，假设每小时 12 个采样点
-    data_mean = np.mean([data[24*12*i: 24*12*(i+1)] for i in range(data.shape[0]//(24*12))], axis=0)
-    data_mean = data_mean.squeeze().T
-    tem_matrix = cosine_similarity(data_mean, data_mean)
+    num_days = data.shape[0] // (24 * 12)
+    if num_days == 0:
+        # 如果数据不足一天，直接对所有时间步求平均
+        data_mean = np.mean(data, axis=0)  # (nodes, 1) or (nodes,)
+    else:
+        data_mean = np.mean([data[24*12*i: 24*12*(i+1)] for i in range(num_days)], axis=0)
+    
+    # 确保形状为 (nodes, features)
+    data_mean = data_mean.squeeze()  # 移除所有长度为1的维度
+    if data_mean.ndim == 1:
+        data_mean = data_mean.reshape(-1, 1)  # (nodes, 1)
+    elif data_mean.ndim > 2:
+        # 如果还有多余维度，强制reshape
+        data_mean = data_mean.reshape(num_node, -1)  # (nodes, features)
+    
+    # 转置为 (nodes, time_features)，然后计算节点间的余弦相似度
+    tem_matrix = cosine_similarity(data_mean, data_mean)  # (nodes, nodes)
+    
     # 指数化并标准化，增强相似度的差别
-    tem_matrix = np.exp((tem_matrix-tem_matrix.mean())/tem_matrix.std())
+    tem_matrix = np.exp((tem_matrix - tem_matrix.mean()) / tem_matrix.std())
     return tem_matrix
 
 
