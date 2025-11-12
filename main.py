@@ -11,42 +11,41 @@ from tqdm import tqdm
 
 # 引入模型与工具函数
 from models.model import PatchSTG
-from lib.utils import log_string, loadData, _compute_loss, metric
+from lib.utils import log_string, _compute_loss, metric
+from lib.data_loader import DataLoader
 
 class Solver(object):
     # 默认配置占位（可以被传入的 config 覆盖）
     DEFAULTS = {}
 
-    def __init__(self, config):
+    def __init__(self, config, data_loader=None):
         """
         Solver 构造函数：把传入的 config 字典扩展到 self 上，
         然后加载数据、初始化模型与优化器等。
 
         参数:
             config (dict): 从 argparse/配置文件解析出的参数字典
+            data_loader (DataLoader): 可选的预加载数据加载器实例
         """
         # 把 DEFAULTS 与外部传入的配置合并到实例属性中
         self.__dict__.update(Solver.DEFAULTS, **config)
 
-        # 记录日志：开始加载数据
-        log_string(log, '\n------------ Loading Data -------------')
-        # 下面是 loadData 返回的多个值的说明：
-        # - trainX/trainY/..: 划分后的训练/验证/测试数据与对应时间特征
-        # - mean/std: 训练数据的均值与标准差（用于归一化/反归一化）
-        # - ori_parts_idx/reo_parts_idx/reo_all_idx: kd-tree 划分与重排索引，用于 patching
-        # 具体细节在 lib/utils.py 的 loadData 函数中实现
-        self.trainX, self.trainY, self.trainXTE, self.trainYTE,\
-        self.valX, self.valY, self.valXTE, self.valYTE,\
-        self.testX, self.testY, self.testXTE, self.testYTE,\
-        self.mean, self.std,\
-        self.ori_parts_idx, self.reo_parts_idx, self.reo_all_idx = loadData(
-                                        self.traffic_file, self.meta_file,
-                                        self.input_len, self.output_len,
-                                        self.train_ratio, self.test_ratio,
-                                        self.adj_file, self.recur_times,
-                                        self.tod, self.dow,
-                                        self.spa_patchsize, log)
-        log_string(log, '------------ End -------------\n')
+        # 初始化或使用提供的数据加载器
+        if data_loader is None:
+            self.data_loader = DataLoader(config, log)
+            self.data_loader.load_data()
+        else:
+            self.data_loader = data_loader
+            # 确保数据已加载
+            if not self.data_loader._loaded:
+                self.data_loader.load_data()
+        
+        # 从数据加载器获取数据
+        self.trainX, self.trainY, self.trainXTE, self.trainYTE = self.data_loader.get_train_data()
+        self.valX, self.valY, self.valXTE, self.valYTE = self.data_loader.get_val_data()
+        self.testX, self.testY, self.testXTE, self.testYTE = self.data_loader.get_test_data()
+        self.mean, self.std = self.data_loader.get_normalization_params()
+        self.ori_parts_idx, self.reo_parts_idx, self.reo_all_idx = self.data_loader.get_patch_indices()
 
         # 训练过程中的最佳 epoch（用于保存最优模型）
         self.best_epoch = 0
@@ -151,11 +150,10 @@ class Solver(object):
             self.model.train()
             train_l_sum, train_acc_sum, batch_count, start = 0.0, 0.0, 0, time.time()
 
-            # 随机打乱训练样本（按样本维度打乱，保持时间序列内部完整）
-            permutation = np.random.permutation(num_train)
-            self.trainX = self.trainX[permutation]
-            self.trainY = self.trainY[permutation]
-            self.trainXTE = self.trainXTE[permutation]
+            # 使用数据加载器打乱训练样本
+            self.data_loader.shuffle_train_data()
+            # 重新获取打乱后的数据
+            self.trainX, self.trainY, self.trainXTE, self.trainYTE = self.data_loader.get_train_data()
 
             num_batch = math.ceil(num_train / self.batch_size)
             # tqdm 显示每个 epoch 的进度条

@@ -1,0 +1,776 @@
+From 0b2d83cf2f75ec8410efde438da45c9d0c72ddcb Mon Sep 17 00:00:00 2001
+From: wishfine <wishfine@U-5VQ3H32J-2355.local>
+Date: Mon, 10 Nov 2025 14:50:29 +0800
+Subject: [PATCH] chore: save local edits to utils, main, models
+
+---
+ lib/utils.py    | 132 +++++++++++++++++++++++++++++++++++++++++-------
+ main.py         |  79 ++++++++++++++++++++++++++---
+ models/model.py | 114 ++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 281 insertions(+), 44 deletions(-)
+
+diff --git a/lib/utils.py b/lib/utils.py
+index 22f8ccc..8a49d53 100644
+--- a/lib/utils.py
++++ b/lib/utils.py
+@@ -4,48 +4,91 @@ import numpy as np
+ import pandas as pd
+ from sklearn.metrics.pairwise import cosine_similarity
+ 
+-# log string
++# 工具模块：包含日志、评估指标、数据变换与分区/重排等函数
++
++# 写日志并同时打印到 stdout，确保日志文件实时刷新
+ def log_string(log, string):
+     log.write(string + '\n')
+     log.flush()
+     print(string)
+ 
+-# metric
++
++# 计算评估指标（针对 numpy 数组）
+ def metric(pred, label):
++    """
++    计算 MAE, RMSE, MAPE。对 label==0 的位置做掩码，避免除零或无意义统计。
++    返回值为 (mae, rmse, mape) 三元组。
++    """
+     with np.errstate(divide = 'ignore', invalid = 'ignore'):
++        # mask 标记 label 不为 0 的位置
+         mask = np.not_equal(label, 0)
+         mask = mask.astype(np.float32)
++        # 归一化 mask，保证不同样本之间的可比较性
+         mask /= np.mean(mask)
++
++        # 绝对误差
+         mae = np.abs(np.subtract(pred, label)).astype(np.float32)
++
++        # WAPE（加权绝对百分比误差），用于衡量总体误差占真实值的比例
+         wape = np.divide(np.sum(mae), np.sum(label))
+         wape = np.nan_to_num(wape * mask)
++
++        # RMSE 需要平方后求均值再开根号
+         rmse = np.square(mae)
++
++        # MAPE（相对误差），在 label 为 0 时会产生 inf，需要 later 用 nan_to_num 处理
+         mape = np.divide(mae, label)
++
++        # 对于存在 NaN 的位置用 0 替代，然后按 mask 计算平均
+         mae = np.nan_to_num(mae * mask)
+         mae = np.mean(mae)
++
+         rmse = np.nan_to_num(rmse * mask)
+         rmse = np.sqrt(np.mean(rmse))
++
+         mape = np.nan_to_num(mape * mask)
+         mape = np.mean(mape)
+     return mae, rmse, mape
+ 
++
+ def masked_mae(preds, labels, null_val=np.nan):
++    """
++    用于训练时的损失计算：对指定的 null_val 或 NaN 位置进行掩码，然后计算平均绝对误差。
++    - preds, labels: torch.Tensor
++    - null_val: 如果为 np.nan，则按 labels 中的 NaN 判定掩码；否则按等于 null_val 判定
++    """
+     if np.isnan(null_val):
++        # mask 为 labels 中非 NaN 的位置
+         mask = ~torch.isnan(labels)
+     else:
+         mask = (labels!=null_val)
+     mask = mask.float()
++    # 归一化 mask，使得不同样本/不同批次之间的损失可比较
+     mask /=  torch.mean((mask))
++    # 将可能产生的 NaN 替换为 0（安全性处理）
+     mask = torch.where(torch.isnan(mask), torch.zeros_like(mask), mask)
++
++    # 计算绝对误差并应用 mask
+     loss = torch.abs(preds-labels)
+     loss = loss * mask
++    # 再次把 NaN 替换为 0，防止后续求均值出错
+     loss = torch.where(torch.isnan(loss), torch.zeros_like(loss), loss)
+     return torch.mean(loss)
+ 
++
+ def _compute_loss(y_true, y_predicted):
++        # 在代码中统一把 (y_true, y_pred) 的位置传入 masked_mae
+         return masked_mae(y_predicted, y_true, 0.0)
+ 
++
+ def seq2instance(data, P, Q):
++    """
++    将时间序列数据切分为监督学习所需的样本对 (X, Y)。
++    - data: shape = (num_step, nodes, dims)
++    - P: 输入序列长度
++    - Q: 预测序列长度
++    返回 x: (num_sample, P, nodes, dims), y: (num_sample, Q, nodes, dims)
++    """
+     num_step, nodes, dims = data.shape
+     num_sample = num_step - P - Q + 1
+     x = np.zeros(shape = (num_sample, P, nodes, dims))
+@@ -55,26 +98,44 @@ def seq2instance(data, P, Q):
+         y[i] = data[i + P : i + P + Q]
+     return x, y
+ 
++
+ def read_meta(path):
++    """
++    读取 metadata CSV（包含 Lat/Lng 列），返回 locations 数组，形状为 (2, N)：[lat, lng]
++    """
+     meta = pd.read_csv(path)
+     lat = meta['Lat'].values
+     lng = meta['Lng'].values
+     locations = np.stack([lat,lng], 0)
+     return locations
+ 
++
+ def construct_adj(data, num_node):
+-    # construct the adj through the cosine similarity
++    """
++    基于余弦相似度构造节点相似度矩阵（用于补齐 patch 时选择相似点）。
++    方法：把时间序列按每天（24 小时 * 12 个采样点/小时）分块求均值，
++    然后对所有节点间的均值向量计算 cosine similarity，最后做指数尺度变换以扩大差异。
++    """
++    # 按天切片并求均值，data.shape[0] 应为时间步数，假设每小时 12 个采样点
+     data_mean = np.mean([data[24*12*i: 24*12*(i+1)] for i in range(data.shape[0]//(24*12))], axis=0)
+     data_mean = data_mean.squeeze().T
+     tem_matrix = cosine_similarity(data_mean, data_mean)
++    # 指数化并标准化，增强相似度的差别
+     tem_matrix = np.exp((tem_matrix-tem_matrix.mean())/tem_matrix.std())
+     return tem_matrix
+ 
++
+ def augmentAlign(dist_matrix, auglen):
+-    # find the most similar points in other leaf nodes
++    """
++    从 dist_matrix 中找到最相似的 auglen 个索引（去重），用于给小片段补齐相似节点。
++    dist_matrix: 距离/相似度矩阵，函数会展平成一维后排序并映射回列索引
++    """
++    # 先按相似度降序排列索引（reshape 并乘 -1 再 argsort 实现降序）
+     sorted_idx = np.argsort(dist_matrix.reshape(-1)*-1)
++    # 由于 reshape 后的索引需要映射回原矩阵的列索引，取模映射
+     sorted_idx = sorted_idx % dist_matrix.shape[-1]
+     augidx = []
++    # 逐个选择不重复的索引直到凑够 auglen 个
+     for idx in sorted_idx:
+         if idx not in augidx:
+             augidx.append(idx)
+@@ -82,38 +143,58 @@ def augmentAlign(dist_matrix, auglen):
+             break
+     return np.array(augidx, dtype=int)
+ 
++
+ def reorderData(parts_idx, mxlen, adj, sps):
+-    # parts_idx: segmented indices by kdtree
+-    # adj: pad similar points through the cos_sim adj
+-    # sps: spatial patch (small leaf nodes) size for padding
++    """
++    根据 kd-tree 划分的 parts_idx（每个叶子节点的点索引列表）进行重排与补齐：
++    - ori_parts_idx: 原始点索引按 patch 顺序拼接
++    - reo_parts_idx: 重排后的 patch 内相对索引（用于后续重排映射）
++    - reo_all_idx: 对每个 patch 进行 padding 补齐后得到的全索引（包含原始与补齐点）
++    参数说明：
++      parts_idx: list of ndarray，每个元素是该叶子节点包含的原始点索引
++      mxlen: 叶子节点内最大长度（未严格使用，但由 kdTree 返回）
++      adj: 相似度矩阵，用于选择补齐点
++      sps: 目标的每个小 patch 大小（若某个叶子节点小于 sps，则需要补齐）
++    """
+     ori_parts_idx = np.array([], dtype=int)
+     reo_parts_idx = np.array([], dtype=int)
+     reo_all_idx = np.array([], dtype=int)
+     for i, part_idx in enumerate(parts_idx):
++        # 选出该 part 在全局 adj 中对应行（用于寻找相似点）
+         part_dist = adj[part_idx, :].copy()
++        # 把与自身的相似度置为 0，避免自己被选为补齐点
+         part_dist[:, part_idx] = 0
+         if sps-part_idx.shape[0] > 0:
++            # 需要补齐：选择最相似的若干点
+             local_part_idx = augmentAlign(part_dist, sps-part_idx.shape[0])
+             auged_part_idx = np.concatenate([part_idx, local_part_idx], 0)
+         else:
+             auged_part_idx = part_idx
+ 
++        # reo_parts_idx 存储 patch 内相对位置的全局偏移（用于重排）
+         reo_parts_idx = np.concatenate([reo_parts_idx, np.arange(part_idx.shape[0])+sps*i])
+         ori_parts_idx = np.concatenate([ori_parts_idx, part_idx])
+         reo_all_idx = np.concatenate([reo_all_idx, auged_part_idx])
+ 
+     return ori_parts_idx, reo_parts_idx, reo_all_idx
+ 
++
+ def kdTree(locations, times, axis):
+-    # locations: [2,N] contains lng and lat
+-    # times: depth of kdtree
+-    # axis: select lng or lat as hyperplane to split points
++    """
++    递归构造 kd-tree 的叶子节点划分：
++    - locations: shape (2, N) 包含 [lat, lng]
++    - times: 递归深度（切分次数），每次把当前点集均分为左右两部分
++    - axis: 决定按第 0 维（lat）还是第 1 维（lng）进行排序分割，axis 会在递归中切换
++    返回 parts: list of ndarrays（每个元素为该叶子节点的原始索引）, 和叶子最大长度
++    """
+     sorted_idx = np.argsort(locations[axis])
+     part1, part2 = np.sort(sorted_idx[:locations.shape[1]//2]), np.sort(sorted_idx[locations.shape[1]//2:])
+     parts = []
+     if times == 1:
++        # 递归终止：返回两个叶子节点
+         return [part1, part2], max(part1.shape[0], part2.shape[0])
+     else:
++        # 继续对左右子集递归划分，axis^1 切换维度
+         left_parts, lmxlen = kdTree(locations[:,part1], times-1, axis^1)
+         right_parts, rmxlen = kdTree(locations[:,part2], times-1, axis^1)
+         for part in left_parts:
+@@ -122,44 +203,59 @@ def kdTree(locations, times, axis):
+             parts.append(part2[part])
+     return parts, max(lmxlen, rmxlen)
+ 
++
+ def loadData(filepath, metapath, P, Q, train_ratio, test_ratio, adjpath, recurtimes, tod, dow, sps, log):
+-    # Traffic
++    """
++    数据加载与预处理主函数：
++    - 读取 traffic npz（假设 key 为 'data'），只取第一个通道（...,:1）
++    - 读取元数据位置文件（lat/lng）
++    - 构造时间特征 TE（time-of-day, day-of-week），并扩展到每个节点
++    - 划分 train/val/test
++    - 加载或构造相似度矩阵 adj
++    - 使用 kdTree/ reorderData 进行空间划分与补齐索引（用于 patching）
++    - 使用 seq2instance 将时间序列切分成样本对
++    - 计算训练集的 mean/std 作为归一化参数
++    返回大量预处理后的数组与索引，供训练/评估使用
++    """
++    # Traffic: 读取数据，npz 中的 'data'，只取到最后一维的第一个通道
+     Traffic = np.load(filepath)['data'][...,:1]
++    # 读取元数据（节点经纬度）
+     locations = read_meta(metapath)
+     num_step = Traffic.shape[0]
+-    # temporal positions
++    # temporal positions: 构造时间特征 TE（两个维度：tod, dow）
+     TE = np.zeros([num_step, 2])
+     TE[:,0] = np.array([i % tod for i in range(num_step)])
+     TE[:,1] = np.array([(i // tod) % dow for i in range(num_step)])
++    # 将时间特征扩展到每个节点：shape -> (num_step, num_nodes, 2)
+     TE_tile = np.repeat(np.expand_dims(TE, 1), Traffic.shape[1], 1)
+     log_string(log, f'Shape of data: {Traffic.shape}')
+     log_string(log, f'Shape of locations: {locations.shape}')
+-    # train/val/test 
++    # train/val/test 划分（按时间维度简单切分）
+     train_steps = round(train_ratio * num_step)
+     test_steps = round(test_ratio * num_step)
+     val_steps = num_step - train_steps - test_steps
+     trainData, trainTE = Traffic[: train_steps], TE_tile[: train_steps]
+     valData, valTE = Traffic[train_steps : train_steps + val_steps], TE_tile[train_steps : train_steps + val_steps]
+     testData, testTE = Traffic[-test_steps :], TE_tile[-test_steps :]
+-    # load adj for padding
++    # load adj for padding（如果存在文件则直接加载，否则基于 trainData 计算并保存）
+     if os.path.exists(adjpath):
+         adj = np.load(adjpath)
+     else:
+         adj = construct_adj(trainData, locations.shape[1])
+         np.save(adjpath, adj)
+-    # partition and pad data with new indices
++    # partition and pad data with new indices（kdTree 划分并重排/补齐）
+     parts_idx, mxlen = kdTree(locations, recurtimes, 0)
+     ori_parts_idx, reo_parts_idx, reo_all_idx = reorderData(parts_idx, mxlen, adj, sps)
+-    # X, Y
++    # X, Y 切分
+     trainX, trainY = seq2instance(trainData, P, Q)
+     valX, valY = seq2instance(valData, P, Q)
+     testX, testY = seq2instance(testData, P, Q)
+     trainXTE, trainYTE = seq2instance(trainTE, P, Q)
+     valXTE, valYTE = seq2instance(valTE, P, Q)
+     testXTE, testYTE = seq2instance(testTE, P, Q)
+-    # normalization
++    # normalization: 使用训练集计算均值与标准差
+     mean, std = np.mean(trainX), np.std(trainX)
+-    # log
++    # log 一些关键信息
+     log_string(log, f'Shape of Train: {trainY.shape}')
+     log_string(log, f'Shape of Validation: {valY.shape}')
+     log_string(log, f'Shape of Test: {testY.shape}')
+diff --git a/main.py b/main.py
+index f1508c6..57ee910 100644
+--- a/main.py
++++ b/main.py
+@@ -9,20 +9,32 @@ import numpy as np
+ import configparser
+ from tqdm import tqdm
+ 
++# 引入模型与工具函数
+ from models.model import PatchSTG
+ from lib.utils import log_string, loadData, _compute_loss, metric
+ 
+ class Solver(object):
++    # 默认配置占位（可以被传入的 config 覆盖）
+     DEFAULTS = {}
+ 
+     def __init__(self, config):
++        """
++        Solver 构造函数：把传入的 config 字典扩展到 self 上，
++        然后加载数据、初始化模型与优化器等。
++
++        参数:
++            config (dict): 从 argparse/配置文件解析出的参数字典
++        """
++        # 把 DEFAULTS 与外部传入的配置合并到实例属性中
+         self.__dict__.update(Solver.DEFAULTS, **config)
+ 
++        # 记录日志：开始加载数据
+         log_string(log, '\n------------ Loading Data -------------')
+-        # tod and dow means the time of the day and the day of the week
+-        # ori_parts_idx indicates the original indices of input points
+-        # reo_parts_idx indicates the patched indices of input points
+-        # reo_all_idx indicates the patched indices of input and padded points
++        # 下面是 loadData 返回的多个值的说明：
++        # - trainX/trainY/..: 划分后的训练/验证/测试数据与对应时间特征
++        # - mean/std: 训练数据的均值与标准差（用于归一化/反归一化）
++        # - ori_parts_idx/reo_parts_idx/reo_all_idx: kd-tree 划分与重排索引，用于 patching
++        # 具体细节在 lib/utils.py 的 loadData 函数中实现
+         self.trainX, self.trainY, self.trainXTE, self.trainYTE,\
+         self.valX, self.valY, self.valXTE, self.valYTE,\
+         self.testX, self.testY, self.testXTE, self.testYTE,\
+@@ -36,12 +48,21 @@ class Solver(object):
+                                         self.spa_patchsize, log)
+         log_string(log, '------------ End -------------\n')
+ 
++        # 训练过程中的最佳 epoch（用于保存最优模型）
+         self.best_epoch = 0
+ 
++        # 设备选择：优先使用指定的 GPU，否则使用 CPU
+         self.device = torch.device(f"cuda:{self.cuda}" if torch.cuda.is_available() else "cpu")
++        # 构建模型与优化器
+         self.build_model()
+     
+     def build_model(self):
++        """
++        构建模型、优化器与学习率调度器。
++        - PatchSTG 的构造函数参数来自配置：时间/空间 patch、节点数、嵌入维度等。
++        - 模型被移动到之前选择的 device 上（CPU/GPU）。
++        """
++        # 实例化模型并放到 device
+         self.model = PatchSTG(self.output_len, self.tem_patchsize, self.tem_patchnum,
+                             self.node_num, self.spa_patchsize, self.spa_patchnum,
+                             self.tod, self.dow,
+@@ -49,9 +70,11 @@ class Solver(object):
+                             self.input_dims, self.node_dims, self.tod_dims, self.dow_dims,
+                             self.ori_parts_idx, self.reo_parts_idx, self.reo_all_idx).to(self.device)
+ 
++        # 优化器：AdamW（包含 weight_decay 正则项）
+         self.optimizer = torch.optim.AdamW(self.model.parameters(),
+                                         lr=self.learning_rate,weight_decay=self.weight_decay)
+ 
++        # 学习率调度器：在指定的里程碑处衰减学习率
+         self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+             self.optimizer,
+             milestones=[1,35,40],
+@@ -59,31 +82,42 @@ class Solver(object):
+         )
+ 
+     def vali(self):
++        # 验证模式：关闭 dropout 等训练相关行为
+         self.model.eval()
+         num_val = self.valX.shape[0]
+-        pred = []
+-        label = []
++        pred = []  # 用于收集分批预测值（反标准化后）
++        label = [] # 用于收集真实标签
+ 
++        # 根据 batch_size 计算需要的 batch 数
+         num_batch = math.ceil(num_val / self.batch_size)
++        # 验证时不需要计算梯度，节省显存与计算
+         with torch.no_grad():
+             for batch_idx in range(num_batch):
+                 if isinstance(self.model, torch.nn.Module):
++                    # 计算当前批次的样本切片范围
+                     start_idx = batch_idx * self.batch_size
+                     end_idx = min(num_val, (batch_idx + 1) * self.batch_size)
+ 
++                    # 从 numpy 缓存中切片出 X/Y/TE
+                     X = self.valX[start_idx : end_idx]
+                     Y = self.valY[start_idx : end_idx]
++                    # TE 与模型在同一 device 上
+                     TE = torch.from_numpy(self.valXTE[start_idx : end_idx]).to(self.device)
++                    # 归一化输入（使用训练集的均值与方差）并转为 float tensor
+                     NormX = torch.from_numpy((X-self.mean)/self.std).float().to(self.device)
+ 
++                    # 前向推理
+                     y_hat = self.model(NormX,TE)
+ 
++                    # 反标准化并转回 numpy，用于后续指标计算
+                     pred.append(y_hat.cpu().numpy()*self.std+self.mean)
+                     label.append(Y)
+         
++        # 把所有分批结果拼接为完整数组
+         pred = np.concatenate(pred, axis = 0)
+         label = np.concatenate(label, axis = 0)
+ 
++        # 逐步计算每个时间步的指标（MAE, RMSE, MAPE），并记录
+         maes = []
+         rmses = []
+         mapes = []
+@@ -95,6 +129,7 @@ class Solver(object):
+             mapes.append(mape)
+             log_string(log,'step %d, mae: %.4f, rmse: %.4f, mape: %.4f' % (i+1, mae, rmse, mape))
+         
++        # 计算整体（所有预测 horizon）的平均指标并返回
+         mae, rmse, mape = metric(pred, label)
+         maes.append(mae)
+         rmses.append(rmse)
+@@ -104,36 +139,50 @@ class Solver(object):
+         return np.stack(maes, 0), np.stack(rmses, 0), np.stack(mapes, 0)
+ 
+     def train(self):
++        # 训练模式入口
+         log_string(log, "======================TRAIN MODE======================")
++        # 用一个足够大的初始最小 loss 方便后续比较
+         min_loss = 10000000.0
+         num_train = self.trainX.shape[0]
+ 
++        # 迭代多个 epoch
+         for epoch in tqdm(range(1,self.max_epoch+1)):
++            # 进入训练模式（启用 dropout 等）
+             self.model.train()
+             train_l_sum, train_acc_sum, batch_count, start = 0.0, 0.0, 0, time.time()
++
++            # 随机打乱训练样本（按样本维度打乱，保持时间序列内部完整）
+             permutation = np.random.permutation(num_train)
+             self.trainX = self.trainX[permutation]
+             self.trainY = self.trainY[permutation]
+             self.trainXTE = self.trainXTE[permutation]
++
+             num_batch = math.ceil(num_train / self.batch_size)
++            # tqdm 显示每个 epoch 的进度条
+             with tqdm(total=num_batch) as pbar:
+                 for batch_idx in range(num_batch):
+                     start_idx = batch_idx * self.batch_size
+                     end_idx = min(num_train, (batch_idx + 1) * self.batch_size)
+ 
++                    # 切片当前 batch 的数据
+                     X = self.trainX[start_idx : end_idx]
+                     Y = self.trainY[start_idx : end_idx]
+                     TE = torch.from_numpy(self.trainXTE[start_idx : end_idx]).to(self.device)
+                     NormX = torch.from_numpy((X-self.mean)/self.std).float().to(self.device)
+                     
++                    # 移动 Y 到 device 以便计算 loss
+                     Y = torch.from_numpy(Y).float().to(self.device)
+                     
++                    # 梯度清零
+                     self.optimizer.zero_grad()
+ 
++                    # 前向
+                     y_hat = self.model(NormX,TE)
+ 
++                    # loss：把预测反标准化到原尺度再计算 masked mae
+                     loss = _compute_loss(Y, y_hat*self.std+self.mean)
+                     
++                    # 反向传播与梯度剪裁
+                     loss.backward()
+                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5)
+                     self.optimizer.step()
+@@ -142,10 +191,13 @@ class Solver(object):
+ 
+                     batch_count += 1
+                     pbar.update(1)
++            # 每个 epoch 结束后记录训练信息并在验证集上评估
+             log_string(log, 'epoch %d, lr %.6f, loss %.4f, time %.1f sec'
+                 % (epoch, self.optimizer.param_groups[0]['lr'], train_l_sum / batch_count, time.time() - start))
+             mae, rmse, mape = self.vali()
++            # 更新学习率
+             self.lr_scheduler.step()
++            # 保存最优模型（以最后一个 horizon 的 mae 作为判断）
+             if mae[-1] < min_loss:
+                 self.best_epoch = epoch
+                 min_loss = mae[-1]
+@@ -154,7 +206,9 @@ class Solver(object):
+         log_string(log, f'Best epoch is: {self.best_epoch}')
+ 
+     def test(self):
++        # 测试入口：加载最优模型并在测试集上评估
+         log_string(log, "======================TEST MODE======================")
++        # 从磁盘加载模型参数（在 CPU/GPU 之间切换由 map_location 控制）
+         self.model.load_state_dict(torch.load(self.model_file, map_location=self.device))
+         self.model.eval()
+         num_val = self.testX.shape[0]
+@@ -206,7 +260,9 @@ if __name__ == '__main__':
+     args = parser.parse_args()
+     config = configparser.ConfigParser()
+     config.read(args.config)
+-
++    # -----------------------
++    # 命令行参数定义（从配置文件中读取默认值）
++    # -----------------------
+     parser.add_argument('--cuda', type=str, default=config['train']['cuda'])
+     parser.add_argument('--seed', type = int, default = config['train']['seed'])
+     parser.add_argument('--batch_size', type = int, default = config['train']['batch_size'])
+@@ -214,12 +270,14 @@ if __name__ == '__main__':
+     parser.add_argument('--learning_rate', type=float, default = config['train']['learning_rate'])
+     parser.add_argument('--weight_decay', type=float, default = config['train']['weight_decay'])
+ 
++    # 数据相关参数
+     parser.add_argument('--input_len', type = int, default = config['data']['input_len'])
+     parser.add_argument('--output_len', type = int, default = config['data']['output_len'])
+     parser.add_argument('--train_ratio', type = float, default = config['data']['train_ratio'])
+     parser.add_argument('--val_ratio', type = float, default = config['data']['val_ratio'])
+     parser.add_argument('--test_ratio', type = float, default = config['data']['test_ratio'])
+ 
++    # 模型结构与 patch 参数（来自 config/param）
+     parser.add_argument('--layers', type=int, default = config['param']['layers'])
+     parser.add_argument('--tem_patchsize', type = int, default = config['param']['tps'])
+     parser.add_argument('--tem_patchnum', type = int, default = config['param']['tpn'])
+@@ -235,16 +293,20 @@ if __name__ == '__main__':
+     parser.add_argument('--tod_dims', type=int, default = config['param']['td'])
+     parser.add_argument('--dow_dims', type=int, default = config['param']['dd'])
+ 
++    # 文件路径参数
+     parser.add_argument('--traffic_file', default = config['file']['traffic'])
+     parser.add_argument('--meta_file', default = config['file']['meta'])
+     parser.add_argument('--adj_file', default = config['file']['adj'])
+     parser.add_argument('--model_file', default = config['file']['model'])
+     parser.add_argument('--log_file', default = config['file']['log'])
+ 
++    # 再次解析命令行（这会把上面添加的参数解析为最终 args）
+     args = parser.parse_args()
+ 
++    # 打开日志文件（以写模式覆盖），log 在程序其它地方被传入记录信息
+     log = open(args.log_file, 'w')
+ 
++    # 随机种子设置，保证可复现（在多平台上可能仍有微差异）
+     if args.seed is not None:
+         random.seed(args.seed)
+         np.random.seed(args.seed)
+@@ -252,13 +314,16 @@ if __name__ == '__main__':
+         torch.cuda.manual_seed(args.seed)
+         torch.backends.cudnn.deterministic = True
+     
++    # 打印/记录所有的运行选项到日志中，便于复现与调试
+     log_string(log, '------------ Options -------------')
+     for k, v in vars(args).items():
+         log_string(log, '%s: %s' % (str(k), str(v)))
+     log_string(log, '-------------- End ----------------')
+ 
++    # 使用解析后的参数 dict 创建 Solver 实例
+     solver = Solver(vars(args))
+ 
++    # 默认执行测试流程（如果你想训练，把上一行注释，打开下面一行）
+     # solver.train()
+     solver.test()
+     
+diff --git a/models/model.py b/models/model.py
+index fea7585..00a2ae8 100644
+--- a/models/model.py
++++ b/models/model.py
+@@ -2,42 +2,98 @@ import torch
+ import torch.nn as nn
+ from timm.models.vision_transformer import Attention, Mlp
+ 
++
++"""
++PatchSTG 模型实现（带中文注释）
++
++包含两个主要类：
++- WindowAttBlock: 在空间 patch 内同时进行 depth（patch 内）与 breadth（patch 间）双注意力操作的模块。
++- PatchSTG: 整体模型，包含时空嵌入、若干 WindowAttBlock 编码层、以及投影解码器。
++
++注意：仅添加注释以便逐行理解。
++"""
++
++
+ class WindowAttBlock(nn.Module):
++    """
++    局部 window 注意力块：实现双 attention
++
++    参数:
++        hidden_size: token 维度（embedding 大小）
++        num_heads: 注意力头数（原代码在创建时传入 1）
++        num: patch 个数（P）
++        size: 每个 patch 中的 token 数（N）
++        mlp_ratio: MLP 隐藏层相对于 hidden_size 的扩张比例
++    """
+     def __init__(self, hidden_size, num_heads, num, size, mlp_ratio=4.0):
+         super().__init__()
+         mlp_hidden_dim = int(hidden_size * mlp_ratio)
++        # num 表示 patch 个数 P，size 表示每个 patch 的 token 数 N
+         self.num, self.size = num, size
+ 
++        # breadth (跨 patch，即 patch 之间的注意力) 使用的归一化、注意力、MLP
++        # 命名中 n 开头代表 "node/breadth"（论文中 breadth attention）
+         self.nnorm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+         self.nattn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1, proj_drop=0.1)
+         self.nnorm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+         self.nmlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.1)
+ 
++        # depth (patch 内，即 patch depth/时间/空间维度内部) 使用的归一化、注意力、MLP
++        # 命名中 s 开头代表 "spatial/depth"（论文中 depth attention）
+         self.snorm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+         self.sattn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, attn_drop=0.1, proj_drop=0.1)
+         self.snorm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+         self.smlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=nn.GELU, drop=0.1)
+ 
+     def forward(self, x):
++        """
++        x 原始形状: (B, T, P*N, D) —— 这里的第三维是把 patch 内点拼接后的长度
++        B: batch size
++        T: time tokens（temporal patch 数，embedding 后的时间维度）
++        P: spatial patch 数（WindowAttBlock 的 num）
++        N: 每个 patch 内的节点数（WindowAttBlock 的 size）
++        D: token 特征维度（hidden_size / embed_dim）
++
++        原始输入 x 形状在进入 block 前被约定为 (B, T, P*N, D)
++        处理流程（保持与论文一致）：
++        1. 先 reshape 成 (B, T, P, N, D)
++        2. depth attention（在每个 patch 内沿 N 维做 attention）
++        3. breadth attention（在 patch 数量 P 上做 attention，跨 patch 聚合信息）
++        4. 最终 reshape 回 (B, T, P*N, D)
++        """
+         B,T,_,D = x.shape
+-        # P: ptach num and N: patch size
++        # P: patch 个数；N: 每个 patch 的 token 数
+         P, N = self.num, self.size
++        # 校验：P * N 应当等于输入的第三维
+         assert self.num * self.size == _
++        # 重塑为五维便于在指定维度上做注意力
+         x = x.reshape(B, T, P, N, D)
+ 
+-        # depth attention
++        # ===================== depth attention（patch 内） =====================
++        # 先把 (B, T, P, N, D) 展为 (B*T*P, N, D)，在 patch 内对 N 个 token 做注意力
+         qkv = self.snorm1(x.reshape(B*T*P,N,D))
++        # sattn 返回 (B*T*P, N, D)，reshape 回原维度并做残差连接
+         x = x + self.sattn(qkv).reshape(B,T,P,N,D)
++        # MLP 层也有残差连接（先归一化再过 MLP）
+         x = x + self.smlp(self.snorm2(x))
+         
+-        # breadth attention
++        # ===================== breadth attention（跨 patch） =====================
++        # 先把维度互换为 (B, T, N, P, D) 再展平为 (B*T*N, P, D)，在 patch 维度上做 attention
+         qkv = self.nnorm1(x.transpose(2,3).reshape(B*T*N,P,D))
++        # 注意这里 reshape 回来需要 transpose 以恢复 (B, T, P, N, D)
+         x = x + self.nattn(qkv).reshape(B,T,N,P,D).transpose(2,3)
+         x = x + self.nmlp(self.nnorm2(x))
+          
++        # 最后把 patch 和 patch 内 token 拼回为一维 (P*N)
+         return x.reshape(B,T,-1,D)
+ 
++
+ class PatchSTG(nn.Module):
++    """
++    PatchSTG 主模型：实现论文中的时空 patching + dual-attention + projection。
++
++    构造参数对应配置文件中的 param 段：tem_patchsize/tem_patchnum/spa_patchsize/spa_patchnum 等。
++    """
+     def __init__(self, output_len, tem_patchsize, tem_patchnum,
+                         node_num, spa_patchsize, spa_patchnum,
+                         tod, dow,
+@@ -46,22 +102,26 @@ class PatchSTG(nn.Module):
+                         ori_parts_idx, reo_parts_idx, reo_all_idx
+                 ):
+         super(PatchSTG, self).__init__()
++        # 节点数量与索引映射（用于 patching 与逆映射）
+         self.node_num = node_num
+         self.ori_parts_idx, self.reo_parts_idx = ori_parts_idx, reo_parts_idx
+         self.reo_all_idx = reo_all_idx
+         self.tod, self.dow = tod, dow
+ 
+-        # model_dims = input_emb + spa_emb + tem_emb
++        # 整体 embedding 维度：输入通道 embedding + 时间 embedding + 空间节点 embedding
+         dims = input_dims + tod_dims + dow_dims + node_dims
+ 
+-        # spatio-temporal embedding -> section 4.1 in paper
+-        # input_emb
++        # ----------------- spatio-temporal embedding（Section 4.1） -----------------
++        # input_emb：用 2D conv 在时间维度上做 patch 投影（kernel height=1, kernel width=tem_patchsize）
++        # 注意 input_st_fc 的输入通道设置为 3（traffic + tod + dow）
+         self.input_st_fc = nn.Conv2d(in_channels=3, out_channels=input_dims, kernel_size=(1, tem_patchsize), stride=(1, tem_patchsize), bias=True)
+-        # spa_emb
++
++        # spa_emb：为每个节点创建可学习的嵌入
+         self.node_emb = nn.Parameter(
+                 torch.empty(node_num, node_dims))
+         nn.init.xavier_uniform_(self.node_emb)
+-        # tem_emb
++
++        # tem_emb：时间-of-day 与 day-of-week 的可学习嵌入
+         self.time_in_day_emb = nn.Parameter(
+                 torch.empty(tod, tod_dims))
+         nn.init.xavier_uniform_(self.time_in_day_emb)
+@@ -69,51 +129,67 @@ class PatchSTG(nn.Module):
+                 torch.empty(dow, dow_dims))
+         nn.init.xavier_uniform_(self.day_in_week_emb)
+ 
+-        # dual attention encoder -> section 4.3 in paper, factors for merging the leaf nodes of KDTree
++        # ----------------- dual attention encoder（Section 4.3） -----------------
++        # factors 用于合并 KD-Tree 的叶子结点（减少 patch 数量），spa_encoder 由若干 WindowAttBlock 组成
++        # 注意：这里将 num_heads 直接传为 1（与论文或实现保持一致）
+         self.spa_encoder = nn.ModuleList([
+             WindowAttBlock(dims, 1, spa_patchnum//factors, spa_patchsize*factors, mlp_ratio=1) for _ in range(layers)
+         ])
+ 
+-        # projection decoder -> section 4.4 in paper
++        # ----------------- projection decoder（Section 4.4） -----------------
++        # 把时序 patch 的通道维（tem_patchnum * dims）映射到 output_len（预测步数）
+         self.regression_conv = nn.Conv2d(in_channels=tem_patchnum*dims, out_channels=output_len, kernel_size=(1, 1), bias=True)
+ 
+     def forward(self, x, te):
+-        # x: [B,T,N,1] input traffic
+-        # te: [B,T,N,2] time information
++        # x: [B,T,N,1] 输入流量
++        # te: [B,T,N,2] 时间特征（tod, dow）
+ 
+-        # spatio-temporal embedding -> section 4.1 in paper
++        # ----------------- embedding（Section 4.1） -----------------
+         embeded_x = self.embedding(x, te)
++        # 选择经过 patching 与 padding 后的索引集合（reo_all_idx）用于 encoder
+         rex = embeded_x[:,:,self.reo_all_idx,:] # select patched points
+ 
+-        # dual attention encoder -> section 4.3 in paper
++        # ----------------- dual attention encoder（Section 4.3） -----------------
+         for block in self.spa_encoder:
+             rex = block(rex)
+ 
++        # 把编码后的结果放回原始节点顺序：先创建一个全零张量，再把 patch 内有效位置填回
+         orginal = torch.zeros(rex.shape[0],rex.shape[1],self.node_num,rex.shape[-1]).to(x.device)
++        # 将 rex 中按重排(reo_parts_idx)的值赋回原始索引位置 ori_parts_idx
+         orginal[:,:,self.ori_parts_idx,:] = rex[:,:,self.reo_parts_idx,:] # back to the original indices
+ 
+-        # projection decoder -> section 4.4 in paper
++        # ----------------- projection decoder（Section 4.4） -----------------
++        # regression_conv 期望输入形状为 (B, C, H, W)，因此先把 orginal 转置并 reshape
+         pred_y = self.regression_conv(orginal.transpose(2,3).reshape(orginal.shape[0],-1,orginal.shape[-2],1))
+ 
+         return pred_y # [B,T,N,1]
+ 
+     def embedding(self, x, te):
++        """
++        构造时空嵌入：
++        - 将 x 与时间特征拼接后经 2D conv 投影得到 input_emb
++        - 把 time-of-day/day-of-week 的可学习嵌入拼接上
++        - 把节点嵌入拼接上，得到最终的输入 embedding
++        T' = T // tem_patchsize 把原始时间序列按多少个连续时间步合并成一个“时间 patch”
++        返回形状: (B, T', N, dims)
++        """
+         b,t,n,_ = x.shape
+ 
+-        # input traffic + time of day + day of week as the input signal
++        # input traffic + time of day + day of week 作为输入信号
+         x1 = torch.cat([x,(te[...,0:1]/self.tod),(te[...,1:2]/self.dow)], -1).float()
++        # input_st_fc 要求输入为 (B, C, H, W) 格式，原始数据先 transpose 再 conv
+         input_data = self.input_st_fc(x1.transpose(1,3)).transpose(1,3)
+         t, d = input_data.shape[1], input_data.shape[-1]        
+ 
+-        # cat time of day embedding
++        # cat time of day embedding：选择最近 t 个时间步的 tod 索引然后用 embedding 表
+         t_i_d_data = te[:, -input_data.shape[1]:, :, 0]
+         input_data = torch.cat([input_data, self.time_in_day_emb[(t_i_d_data).type(torch.LongTensor)]], -1)
+ 
+-        # cat day of week embedding
++        # cat day of week embedding：同上
+         d_i_w_data = te[:, -input_data.shape[1]:, :, 1]
+         input_data = torch.cat([input_data, self.day_in_week_emb[(d_i_w_data).type(torch.LongTensor)]], -1)
+ 
+-        # cat spatial embedding
++        # cat spatial embedding：为每个节点广播 node_emb 并拼接
+         node_emb = self.node_emb.unsqueeze(0).unsqueeze(1).expand(b, t, -1, -1)
+         input_data = torch.cat([input_data, node_emb], -1)
+ 
+-- 
+2.50.1 (Apple Git-155)
+

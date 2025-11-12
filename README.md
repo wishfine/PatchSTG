@@ -93,14 +93,89 @@ You can access the well pre-processed datasets from [[Google Drive]](https://dri
 You can access the pretrained weights from [[Google Drive]](https://drive.google.com/drive/folders/1hFyV2C10P3wl3OJkNNhhHb2LTKXcJ2mO?usp=sharing), then place the downloaded contents under the constructed cpt folder `./cpt`.
 
 ## Quick Demos
+
+### Using Pre-processed Datasets (NPZ format)
+
 1. Download datasets and place them under `./data`
 2. We provide pre-trained weights of results in the paper and the detail configurations under the folder `./config`. For example, you can test the SD dataset by:
 
-```
+```bash
 python main.py --config ./config/SD.conf
 ```
 
 3. If you want to train the model yourself, you can use the code at line 262 of the main file.
+
+### Using ODPS Data (MaxCompute) 🆕
+
+We now support training directly from MaxCompute tables! This is useful for large-scale production scenarios.
+
+#### Quick Start
+
+1. **Set up ODPS credentials**:
+```bash
+export ALIBABA_CLOUD_ACCESS_KEY_ID="your_access_key_id"
+export ALIBABA_CLOUD_ACCESS_KEY_SECRET="your_access_key_secret"
+```
+
+2. **Check environment**:
+```bash
+python quickstart_odps.py
+```
+
+3. **Edit configuration** `config/ODPS.conf`:
+```ini
+[data]
+adcode = 110000           # City code (110000=Beijing, 310000=Shanghai, etc.)
+start_date = 20250701     # Start date (YYYYMMDD)
+end_date = 20250731       # End date (YYYYMMDD)
+
+# Optional: Metadata table for spatial patching (recommended for best performance)
+odps_meta_table = tb_inter_spatial_node_location
+```
+
+> 📖 **About Metadata Table**: The metadata table contains geographic locations (lat/lng) of road segments, enabling KD-tree based spatial patching for better performance. See [META_TABLE_GUIDE.md](META_TABLE_GUIDE.md) for how to create it. If not provided, the model will use simple sequential patching.
+
+4. **Check data quality** (recommended before training):
+```bash
+python check_odps_data.py --config config/ODPS.conf
+```
+
+5. **Start training**:
+```bash
+# Train only
+python train_odps.py --config config/ODPS.conf --mode train
+
+# Test only
+python train_odps.py --config config/ODPS.conf --mode test
+
+# Train and test
+python train_odps.py --config config/ODPS.conf --mode both
+```
+
+#### Features
+
+- ✅ Load data directly from MaxCompute tables
+- ✅ Support filtering by city (adcode) and date range
+- ✅ Automatic node discovery and dataset generation
+- ✅ Built-in data quality checks
+- ✅ Compatible with existing PatchSTG architecture
+
+#### Documentation
+
+- 📖 [ODPS Training Guide](ODPS_TRAINING_GUIDE.md) - Complete guide for using ODPS data
+- 📖 [Meta Table Guide](META_TABLE_GUIDE.md) - How to create metadata table for spatial patching
+- 📖 [Data Loader README](DATA_LOADER_README.md) - Data loading architecture
+
+#### City Codes
+
+| City | Code |
+|------|------|
+| Beijing | 110000 |
+| Shanghai | 310000 |
+| Guangzhou | 440100 |
+| Shenzhen | 440300 |
+| Hangzhou | 330100 |
+| Chengdu | 510100 |
 
 
 ## Further Reading
