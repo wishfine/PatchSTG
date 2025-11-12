@@ -136,6 +136,10 @@ def construct_adj(data, num_node):
         # 如果还有多余维度，强制reshape
         data_mean = data_mean.reshape(num_node, -1)  # (nodes, features)
     
+    # 断言：确保 data_mean 的第一维是 num_node
+    assert data_mean.shape[0] == num_node, \
+        f"data_mean 的节点维度不匹配: {data_mean.shape[0]} != {num_node}"
+    
     # 转置为 (nodes, time_features)，然后计算节点间的余弦相似度
     tem_matrix = cosine_similarity(data_mean, data_mean)  # (nodes, nodes)
     
