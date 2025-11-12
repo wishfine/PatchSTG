@@ -60,6 +60,7 @@ class ODPSDataLoader:
         self.adcode = config.get('adcode', None)
         self.start_date = config.get('start_date', None)
         self.end_date = config.get('end_date', None)
+        self.limit = config.get('limit', None)  # 可选：限制查询行数（用于测试）
         
         # 训练参数
         self.input_len = config.get('input_len', 12)
@@ -147,6 +148,9 @@ class ODPSDataLoader:
         
         where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
         
+        # 构建 LIMIT 子句
+        limit_clause = f"\nLIMIT {self.limit}" if self.limit else ""
+        
         query = f"""
         SELECT 
             nds_id,
@@ -159,7 +163,7 @@ class ODPSDataLoader:
             dym_feat_feat
         FROM {self.odps_table}
         WHERE {where_clause}
-        ORDER BY nds_id, next_nds_id, passts_time
+        ORDER BY nds_id, next_nds_id, passts_time{limit_clause}
         """
         
         return query
