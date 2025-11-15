@@ -267,6 +267,89 @@ class ODPSDataLoader:
             log_string(self.log, f'Mean: {self.mean:.4f}, Std: {self.std:.4f}')
             log_string(self.log, '------------ End -------------\n')
     
+    def load_data_for_date_range(self, start_date, end_date):
+        """
+        为指定日期范围加载数据（方案 3：分批加载训练）
+        
+        📌 用法：在训练循环中多次调用，每次加载不同日期的数据
+        
+        参数:
+            start_date (str): 开始日期 'YYYYMMDD'
+            end_date (str): 结束日期 'YYYYMMDD'
+        
+        示例:
+            # 每次训练加载 2 天数据
+            for date_batch in date_chunks:
+                data_loader.load_data_for_date_range('20250919', '20250920')
+                trainX, trainY, trainXTE, trainYTE = data_loader.get_train_data()
+                # 训练这批数据...
+                data_loader.clear_data()  # 释放内存
+        """
+        if self.log:
+            log_string(self.log, f'\n🔄 Loading data for date range: {start_date} ~ {end_date}')
+        
+        # 临时修改配置的日期范围
+        original_start = self.start_date
+        original_end = self.end_date
+        self.start_date = start_date
+        self.end_date = end_date
+        
+        # 如果是首次加载，需要初始化客户端和节点列表
+        if self._odps_client is None:
+            self._init_odps_client()
+        
+        if self.node_list is None:
+            if self.log:
+                log_string(self.log, 'Step 1: Loading node list (first time)...')
+            # 使用原始完整日期范围获取节点列表
+            self.start_date = original_start
+            self.end_date = original_end
+            self._load_node_list_from_odps()
+            # 恢复当前批次的日期范围
+            self.start_date = start_date
+            self.end_date = end_date
+        
+        if self.node_locations is None:
+            if self.log:
+                log_string(self.log, 'Step 2: Loading node locations (first time)...')
+            self._load_node_locations()
+        
+        # 流式读取当前日期范围的数据
+        if self.log:
+            log_string(self.log, 'Step 3: Streaming data for this date range...')
+        self._stream_and_process_data()
+        
+        # 恢复原始日期配置
+        self.start_date = original_start
+        self.end_date = original_end
+        self._loaded = True
+        
+        if self.log:
+            log_string(self.log, f'✅ Loaded {self.trainX.shape[0]} samples for {start_date} ~ {end_date}\n')
+    
+    def clear_data(self):
+        """
+        清空已加载的数据，释放内存
+        
+        📌 用于分批加载场景：训练完当前批次后释放内存
+        """
+        self.trainX = None
+        self.trainY = None
+        self.trainXTE = None
+        self.trainYTE = None
+        self.valX = None
+        self.valY = None
+        self.valXTE = None
+        self.valYTE = None
+        self.testX = None
+        self.testY = None
+        self.testXTE = None
+        self.testYTE = None
+        self._loaded = False
+        
+        if self.log:
+            log_string(self.log, '🗑️  Data cleared, memory released')
+    
     def _load_node_list_from_odps(self):
         """
         从 ODPS 查询唯一的节点列表
