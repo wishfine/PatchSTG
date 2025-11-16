@@ -218,6 +218,19 @@ def reorderData(parts_idx, mxlen, adj, sps):
         ori_parts_idx = np.concatenate([ori_parts_idx, part_idx])
         reo_all_idx = np.concatenate([reo_all_idx, auged_part_idx])
 
+    # 防御性处理：确保返回的索引在合法范围内，避免后续索引越界（尤其是极小样本场景）
+    try:
+        num_node = adj.shape[0]
+    except Exception:
+        num_node = max(1, int(np.max(ori_parts_idx)) + 1 if ori_parts_idx.size > 0 else 1)
+
+    if ori_parts_idx.size > 0:
+        ori_parts_idx = np.clip(ori_parts_idx, 0, max(0, num_node - 1)).astype(int)
+    if reo_parts_idx.size > 0:
+        reo_parts_idx = reo_parts_idx.astype(int)
+    if reo_all_idx.size > 0:
+        reo_all_idx = np.clip(reo_all_idx, 0, max(0, num_node - 1)).astype(int)
+
     return ori_parts_idx, reo_parts_idx, reo_all_idx
 
 
@@ -334,7 +347,18 @@ def loadDataFromSamples(sample_data_dict, locations, adjpath, recurtimes, sps, l
 
     if os.path.exists(adjpath):
         adj = np.load(adjpath)
-        log_string(log, f'Loaded adj matrix from {adjpath}')
+        # 如果已有 adj 与当前数据的节点数不匹配则重建，避免使用历史大图导致索引越界
+        if adj.shape[0] == num_node and adj.shape[1] == num_node:
+            log_string(log, f'Loaded adj matrix from {adjpath}')
+        else:
+            log_string(
+                log,
+                f'WARNING: adj shape {adj.shape} != (num_node, num_node)=({num_node},{num_node}), will rebuild adj for current data.'
+            )
+            train_data_for_adj = trainX.transpose(1, 0, 2, 3).reshape(-1, num_node, 1)
+            adj = construct_adj(train_data_for_adj, num_node)
+            np.save(adjpath, adj)
+            log_string(log, f'Constructed and saved adj matrix to {adjpath}')
     else:
         train_data_for_adj = trainX.transpose(1, 0, 2, 3).reshape(-1, num_node, 1)
         adj = construct_adj(train_data_for_adj, num_node)
