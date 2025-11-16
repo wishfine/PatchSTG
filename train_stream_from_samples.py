@@ -409,12 +409,25 @@ def main():
     cfg = parse_config(args.config)
     cfg["cuda"] = args.cuda
 
-    solver = StreamSampleSolver(cfg)
-    solver.train()
-
-    # 关闭日志
+    # 捕获所有异常并写入日志文件
+    import traceback
     global log
-    log.close()
+    log = None
+    try:
+        solver = StreamSampleSolver(cfg)
+        solver.train()
+    except Exception as e:
+        # 如果日志已经初始化成功，则把异常也写入日志
+        if log is not None:
+            log_string(log, "======================EXCEPTION======================")
+            log_string(log, repr(e))
+            log_string(log, traceback.format_exc())
+            log_string(log, "====================================================")
+        # 同时继续抛出，让 nohup/out 也有 traceback
+        raise
+    finally:
+        if log is not None:
+            log.close()
 
 
 if __name__ == "__main__":
