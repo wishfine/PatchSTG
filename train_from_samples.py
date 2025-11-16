@@ -1,411 +1,444 @@
 """
-从预处理样本表直接训练 - 方案 2（极速版）
+从 MaxCompute 预处理样本表训练 PatchSTG 模型
 
-功能：
-1. 从 ODPS 样本表直接读取已处理的样本
-2. 反序列化为 numpy 数组
-3. 开始训练（无需任何数据处理）
+与 main.py 的区别:
+1. 数据来源: tb_patchstg_train_samples_full (预处理表) 而非 npz 文件
+2. 时间特征: 6维 (week, hour, minute, day_type, day, month) 而非 2维 (tod, dow)
+3. 城市范围: 混合多城市训练
+4. 数据格式: 已经是滑动窗口样本,不需要 seq2instance
 
-速度：秒级加载 → 立即开始训练！
+使用方法:
+    python train_from_samples.py --config config/samples.conf --cuda 0
+
+作者: AI Assistant
+日期: 2025-11-15
 """
 
-import os
-import sys
 import math
 import time
-import random
-import argparse
-import json
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import random
+import argparse
+import numpy as np
+import configparser
 from tqdm import tqdm
-from odps import ODPS
-from datetime import datetime
+import os
 
-# 添加项目路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
+# 引入模型与工具函数
 from models.model import PatchSTG
-from lib.utils import log_string, _compute_loss, metric
+from lib.utils import log_string, _compute_loss, metric, loadDataFromSamples
+from lib.patchstg_sample_loader import PatchSTGSampleLoader, build_locations_from_pairs
 
 
-def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='从样本表训练 PatchSTG')
-    
-    # ODPS 配置
-    parser.add_argument('--odps_project', type=str, required=True)
-    parser.add_argument('--odps_endpoint', type=str, required=True)
-    parser.add_argument('--sample_table', type=str, required=True,
-                        help='预处理好的样本表名')
-    parser.add_argument('--metadata_file', type=str, required=True,
-                        help='预处理元数据文件 (JSON)')
-    
-    # 训练参数
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--max_epoch', type=int, default=50)
-    parser.add_argument('--learning_rate', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=0.0001)
-    parser.add_argument('--seed', type=int, default=10)
-    parser.add_argument('--cuda', type=str, default='0')
-    
-    # 模型参数
-    parser.add_argument('--layers', type=int, default=3)
-    parser.add_argument('--tem_patchsize', type=int, default=12)
-    parser.add_argument('--tem_patchnum', type=int, default=1)
-    parser.add_argument('--factors', type=int, default=5)
-    parser.add_argument('--spa_patchsize', type=int, default=4)
-    parser.add_argument('--spa_patchnum', type=int, default=6)
-    parser.add_argument('--tod', type=int, default=288)
-    parser.add_argument('--dow', type=int, default=7)
-    parser.add_argument('--input_dims', type=int, default=1)
-    parser.add_argument('--node_dims', type=int, default=64)
-    parser.add_argument('--tod_dims', type=int, default=64)
-    parser.add_argument('--dow_dims', type=int, default=64)
-    
-    # 输出
-    parser.add_argument('--model_file', type=str, default=None)
-    parser.add_argument('--log_file', type=str, default=None)
-    
-    return parser.parse_args()
-
-
-def deserialize_array(s, shape):
-    """反序列化字符串为 numpy 数组"""
-    arr = np.array([float(x) for x in s.split(',')])
-    return arr.reshape(shape)
-
-
-def load_samples_from_odps(odps_client, table_name, split, metadata):
+class SampleSolver(object):
     """
-    从 ODPS 样本表加载数据
+    使用预处理样本训练 PatchSTG 的 Solver
     
-    参数:
-        odps_client: ODPS 客户端
-        table_name: 表名
-        split: 'train' / 'val' / 'test'
-        metadata: 元数据字典
-    
-    返回:
-        X, Y, TE_X, TE_Y (numpy 数组)
-    """
-    print(f"\n📥 加载 {split} 数据从 {table_name}...")
-    
-    # 查询指定 split 的数据
-    query = f"""
-    SELECT X, Y, TE_X, TE_Y
-    FROM {table_name}
-    WHERE split = '{split}'
+    主要改动:
+    - 使用 PatchSTGSampleLoader 加载数据
+    - 支持 6 维时间特征
+    - 模型需要适配新的时间特征维度
     """
     
-    # 从元数据获取形状信息
-    num_nodes = metadata['node_num']
-    input_len = metadata['input_len']
-    output_len = metadata['output_len']
+    def __init__(self, config):
+        """
+        参数:
+            config (dict): 配置参数字典
+        """
+        self.__dict__.update(**config)
+        self.run_timestamp = time.strftime("%Y%m%d_%H%M%S")
+        self.log_file = self._build_timestamped_log_path(self.log_file, self.run_timestamp)
+        
+        # 初始化日志
+        log_dir = os.path.dirname(self.log_file)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        global log
+        log = open(self.log_file, 'w')
+        log_string(log, "======================CONFIG======================")
+        for key, value in config.items():
+            log_string(log, f"{key}: {value}")
+        log_string(log, "==================================================")
+        log_string(log, f"日志文件: {self.log_file}")
+        
+        # 加载数据
+        self.load_sample_data()
+        
+        # 设备选择
+        self.device = torch.device(f"cuda:{self.cuda}" if torch.cuda.is_available() else "cpu")
+        log_string(log, f"使用设备: {self.device}")
+        
+        # 构建模型
+        self.build_model()
+        
+        self.best_epoch = 0
+
+    def _build_timestamped_log_path(self, base_path, timestamp):
+        """根据启动时间生成带时间戳的日志文件路径"""
+        if not base_path:
+            base_path = os.path.join('log', 'patchstg.log')
+        log_dir = os.path.dirname(base_path) or '.'
+        filename = os.path.basename(base_path) or 'patchstg.log'
+        name, ext = os.path.splitext(filename)
+        if not ext:
+            ext = '.log'
+        timestamped_name = f"{name}_{timestamp}{ext}"
+        return os.path.join(log_dir, timestamped_name)
     
-    X_list = []
-    Y_list = []
-    TE_X_list = []
-    TE_Y_list = []
+    def load_sample_data(self):
+        """
+        使用 PatchSTGSampleLoader 加载样本数据
+        """
+        log_string(log, "======================LOADING DATA======================")
+        
+        # 初始化数据加载器
+        loader = PatchSTGSampleLoader(
+            odps_project=self.odps_project,
+            odps_table=self.odps_table,
+            ds_partition=self.ds_partition,
+            train_ratio=self.train_ratio,
+            val_ratio=self.val_ratio,
+            use_6dim_time_feat=getattr(self, 'use_6dim_time_feat', False),
+        )
+        
+        # 加载样本数据
+        if hasattr(self, 'debug_csv') and self.debug_csv:
+            # 调试模式: 从本地CSV加载
+            log_string(log, f"调试模式: 从CSV加载数据: {self.debug_csv}")
+            loader.load_from_csv(self.debug_csv)
+        else:
+            # 生产模式: 从MaxCompute加载
+            log_string(log, f"从 MaxCompute 加载数据: {self.odps_table}, ds={self.ds_partition}")
+            loader.load_from_odps(limit=getattr(self, 'data_limit', None))
+        
+        # 加载路口位置信息
+        if hasattr(self, 'inter_location_dict') and self.inter_location_dict:
+            # 从字典加载 (用于调试)
+            loader.load_inter_locations(self.inter_location_dict)
+        elif hasattr(self, 'inter_location_table'):
+            # 从 MaxCompute 表加载
+            loader.load_inter_locations_from_odps(self.inter_location_table)
+        else:
+            log_string(log, "警告: 未提供路口位置信息,将无法进行空间划分")
+        
+        # 准备训练数据
+        data_dict = loader.prepare_training_data(normalize=False)
+        self.sample_metadata = data_dict['metadata']
+        
+        # 构建 locations 矩阵 (用于KDTree)
+        unique_pairs = self.sample_metadata['node_pairs']
+        if loader.inter_id_locations:
+            locations = build_locations_from_pairs(unique_pairs, loader.inter_id_locations)
+            log_string(log, f"构建 locations 矩阵: shape={locations.shape}")
+        else:
+            # 如果没有位置信息,使用随机位置 (仅用于调试)
+            log_string(log, "警告: 使用随机位置进行空间划分 (仅调试)")
+            num_pairs = len(unique_pairs)
+            locations = np.random.rand(2, num_pairs).astype(np.float32)
+        
+        # 使用 loadDataFromSamples 进行空间划分
+        adjpath = os.path.join(self.model_file.replace('.pth', '_adj.npy'))
+        result = loadDataFromSamples(
+            data_dict,
+            locations,
+            adjpath,
+            self.recurtimes,
+            self.spa_patchsize,
+            log
+        )
+        
+        # 解包结果
+        (self.trainX, self.trainY, self.trainXTE, self.trainYTE,
+         self.valX, self.valY, self.valXTE, self.valYTE,
+         self.testX, self.testY, self.testXTE, self.testYTE,
+         self.mean, self.std,
+         self.ori_parts_idx, self.reo_parts_idx, self.reo_all_idx) = result
+        
+        # 更新节点数量 (实际的最大节点数)
+        self.node_num = self.trainX.shape[2]
+        log_string(log, f"节点数量 (max_nodes): {self.node_num}")
+        
+        # 时间特征维度
+        self.time_feat_dim = self.sample_metadata.get('time_feat_dim', 2)
+        log_string(log, f"时间特征维度: {self.time_feat_dim}")
+        log_string(log, "=======================================================")
     
-    with odps_client.execute_sql(query).open_reader() as reader:
-        for record in tqdm(reader, desc=f"读取 {split}"):
-            # 反序列化
-            X = deserialize_array(record[0], (input_len, num_nodes, 1))
-            Y = deserialize_array(record[1], (output_len, num_nodes, 1))
-            TE_X = deserialize_array(record[2], (input_len, 2))
-            TE_Y = deserialize_array(record[3], (output_len, 2))
+    def build_model(self):
+        """
+        构建模型、优化器与学习率调度器
+        
+        注意: 需要修改模型以支持6维时间特征
+        """
+        log_string(log, "======================BUILD MODEL======================")
+        
+        # 实例化模型
+        # 注意: 原始 PatchSTG 假设时间特征是 2 维 (tod, dow)
+        # 现在需要传入 6 维特征,可能需要修改模型代码
+        # 这里先使用原始模型,后续可能需要调整
+        
+        try:
+            self.model = PatchSTG(
+                self.output_len,
+                self.tem_patchsize,
+                self.tem_patchnum,
+                self.node_num,
+                self.spa_patchsize,
+                self.spa_patchnum,
+                # 时间特征相关 - 保持兼容性
+                self.tod if hasattr(self, 'tod') else 24,  # tod 默认 24
+                self.dow if hasattr(self, 'dow') else 7,   # dow 默认 7
+                self.layers,
+                self.factors,
+                self.input_dims,
+                self.node_dims,
+                # 时间嵌入维度 - 需要根据6维调整
+                getattr(self, 'tod_dims', 8),  # 可以复用或调整
+                getattr(self, 'dow_dims', 8),
+                self.ori_parts_idx,
+                self.reo_parts_idx,
+                self.reo_all_idx
+            ).to(self.device)
             
-            X_list.append(X)
-            Y_list.append(Y)
-            TE_X_list.append(TE_X)
-            TE_Y_list.append(TE_Y)
+            log_string(log, f"模型参数数量: {sum(p.numel() for p in self.model.parameters())}")
+        except Exception as e:
+            log_string(log, f"模型构建失败: {e}")
+            log_string(log, "可能需要修改 PatchSTG 模型以支持 6 维时间特征")
+            raise
+        
+        # 优化器
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=self.weight_decay
+        )
+        
+        # 学习率调度器
+        self.lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            self.optimizer,
+            milestones=getattr(self, 'milestones', [1, 35, 40]),
+            gamma=getattr(self, 'lr_gamma', 0.5),
+        )
+        
+        log_string(log, "=======================================================")
     
-    # 转换为 numpy 数组
-    X = np.array(X_list)
-    Y = np.array(Y_list)
-    TE_X = np.array(TE_X_list)
-    TE_Y = np.array(TE_Y_list)
-    
-    print(f"✅ {split} 数据加载完成")
-    print(f"   X: {X.shape}")
-    print(f"   Y: {Y.shape}")
-    print(f"   TE_X: {TE_X.shape}")
-    print(f"   TE_Y: {TE_Y.shape}")
-    
-    return X, Y, TE_X, TE_Y
-
-
-def validate(model, valX, valY, valXTE, mean, std, device, batch_size):
-    """验证函数"""
-    model.eval()
-    num_val = valX.shape[0]
-    pred = []
-    label = []
-
-    num_batch = math.ceil(num_val / batch_size)
-    
-    with torch.no_grad():
-        for batch_idx in range(num_batch):
-            start_idx = batch_idx * batch_size
-            end_idx = min(num_val, (batch_idx + 1) * batch_size)
-
-            X = valX[start_idx:end_idx]
-            Y = valY[start_idx:end_idx]
-            TE = torch.from_numpy(valXTE[start_idx:end_idx]).to(device)
-            NormX = torch.from_numpy((X - mean) / std).float().to(device)
-
-            y_hat = model(NormX, TE)
-            pred.append(y_hat.cpu().numpy() * std + mean)
-            label.append(Y)
-    
-    pred = np.concatenate(pred, axis=0)
-    label = np.concatenate(label, axis=0)
-
-    maes = []
-    rmses = []
-    mapes = []
-
-    for i in range(pred.shape[1]):
-        mae, rmse, mape = metric(pred[:, i, :], label[:, i, :])
+    def vali(self):
+        """验证模式"""
+        self.model.eval()
+        num_val = self.valX.shape[0]
+        pred = []
+        label = []
+        
+        num_batch = math.ceil(num_val / self.batch_size)
+        with torch.no_grad():
+            for batch_idx in range(num_batch):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(num_val, (batch_idx + 1) * self.batch_size)
+                
+                X = self.valX[start_idx : end_idx]
+                Y = self.valY[start_idx : end_idx]
+                TE = torch.from_numpy(self.valXTE[start_idx : end_idx]).to(self.device)
+                NormX = torch.from_numpy((X - self.mean) / self.std).float().to(self.device)
+                
+                y_hat = self.model(NormX, TE)
+                
+                pred.append(y_hat.cpu().numpy() * self.std + self.mean)
+                label.append(Y)
+        
+        pred = np.concatenate(pred, axis=0)
+        label = np.concatenate(label, axis=0)
+        
+        # 计算指标
+        maes, rmses, mapes = [], [], []
+        for i in range(pred.shape[1]):
+            mae, rmse, mape = metric(pred[:, i, :], label[:, i, :])
+            maes.append(mae)
+            rmses.append(rmse)
+            mapes.append(mape)
+            log_string(log, f'step {i+1}, mae: {mae:.4f}, rmse: {rmse:.4f}, mape: {mape:.4f}')
+        
+        mae, rmse, mape = metric(pred, label)
         maes.append(mae)
         rmses.append(rmse)
         mapes.append(mape)
+        log_string(log, f'average, mae: {mae:.4f}, rmse: {rmse:.4f}, mape: {mape:.4f}')
+        
+        return np.stack(maes, 0), np.stack(rmses, 0), np.stack(mapes, 0)
     
-    mae, rmse, mape = metric(pred, label)
-    maes.append(mae)
-    rmses.append(rmse)
-    mapes.append(mape)
+    def train(self):
+        """训练模式"""
+        log_string(log, "======================TRAIN MODE======================")
+        min_loss = 10000000.0
+        num_train = self.trainX.shape[0]
+        
+        for epoch in tqdm(range(1, self.max_epoch + 1)):
+            self.model.train()
+            train_l_sum, batch_count, start = 0.0, 0, time.time()
+            
+            # 随机打乱训练数据
+            permutation = np.random.permutation(num_train)
+            self.trainX = self.trainX[permutation]
+            self.trainY = self.trainY[permutation]
+            self.trainXTE = self.trainXTE[permutation]
+            self.trainYTE = self.trainYTE[permutation]
+            
+            num_batch = math.ceil(num_train / self.batch_size)
+            
+            for batch_idx in range(num_batch):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(num_train, (batch_idx + 1) * self.batch_size)
+                
+                X = self.trainX[start_idx : end_idx]
+                Y = self.trainY[start_idx : end_idx]
+                TE = torch.from_numpy(self.trainXTE[start_idx : end_idx]).to(self.device)
+                
+                NormX = torch.from_numpy((X - self.mean) / self.std).float().to(self.device)
+                NormY = torch.from_numpy((Y - self.mean) / self.std).float().to(self.device)
+                
+                self.optimizer.zero_grad()
+                y_hat = self.model(NormX, TE)
+                loss = _compute_loss(NormY, y_hat)
+                
+                loss.backward()
+                self.optimizer.step()
+                
+                train_l_sum += loss.cpu().item()
+                batch_count += 1
+            
+            self.lr_scheduler.step()
+            
+            # 验证
+            log_string(log, f'epoch {epoch}, lr {self.optimizer.param_groups[0]["lr"]:.6f}, '
+                           f'train loss {train_l_sum / batch_count:.6f}, time {time.time() - start:.1f}s')
+            
+            maes, rmses, mapes = self.vali()
+            
+            # 保存最优模型
+            if maes[-1] < min_loss:
+                min_loss = maes[-1]
+                self.best_epoch = epoch
+                torch.save(self.model.state_dict(), self.model_file)
+                log_string(log, f'保存模型到: {self.model_file}')
+        
+        log_string(log, f'最佳 epoch: {self.best_epoch}')
+        log_string(log, "======================TRAIN END======================")
     
-    return np.stack(maes, 0), np.stack(rmses, 0), np.stack(mapes, 0)
+    def test(self):
+        """测试模式"""
+        log_string(log, "======================TEST MODE======================")
+        
+        # 加载最优模型
+        self.model.load_state_dict(torch.load(self.model_file))
+        log_string(log, f'加载模型: {self.model_file}')
+        
+        self.model.eval()
+        num_test = self.testX.shape[0]
+        pred = []
+        label = []
+        
+        num_batch = math.ceil(num_test / self.batch_size)
+        with torch.no_grad():
+            for batch_idx in range(num_batch):
+                start_idx = batch_idx * self.batch_size
+                end_idx = min(num_test, (batch_idx + 1) * self.batch_size)
+                
+                X = self.testX[start_idx : end_idx]
+                Y = self.testY[start_idx : end_idx]
+                TE = torch.from_numpy(self.testXTE[start_idx : end_idx]).to(self.device)
+                NormX = torch.from_numpy((X - self.mean) / self.std).float().to(self.device)
+                
+                y_hat = self.model(NormX, TE)
+                
+                pred.append(y_hat.cpu().numpy() * self.std + self.mean)
+                label.append(Y)
+        
+        pred = np.concatenate(pred, axis=0)
+        label = np.concatenate(label, axis=0)
+        
+        # 计算指标
+        maes, rmses, mapes = [], [], []
+        for i in range(pred.shape[1]):
+            mae, rmse, mape = metric(pred[:, i, :], label[:, i, :])
+            maes.append(mae)
+            rmses.append(rmse)
+            mapes.append(mape)
+            log_string(log, f'step {i+1}, mae: {mae:.4f}, rmse: {rmse:.4f}, mape: {mape:.4f}')
+        
+        mae, rmse, mape = metric(pred, label)
+        log_string(log, f'average, mae: {mae:.4f}, rmse: {rmse:.4f}, mape: {mape:.4f}')
+        log_string(log, "=======================================================")
 
 
-def main():
-    """主函数"""
-    args = parse_args()
+def parse_config(config_file):
+    """解析配置文件"""
+    config = configparser.ConfigParser()
+    config.read(config_file)
     
-    print("=" * 80)
-    print("🚀 PatchSTG 从样本表训练 - 方案 2（极速版）")
-    print("=" * 80)
-    print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+    # 提取配置参数
+    params = {}
     
-    # 读取元数据
-    print("📋 读取元数据...")
-    with open(args.metadata_file, 'r') as f:
-        metadata = json.load(f)
+    # Data
+    params['odps_project'] = config.get('Data', 'odps_project')
+    params['odps_table'] = config.get('Data', 'odps_table')
+    params['ds_partition'] = config.get('Data', 'ds_partition')
+    params['train_ratio'] = config.getfloat('Data', 'train_ratio', fallback=0.7)
+    params['val_ratio'] = config.getfloat('Data', 'val_ratio', fallback=0.1)
+    params['use_6dim_time_feat'] = config.getboolean('Data', 'use_6dim_time_feat', fallback=False)
     
-    print("元数据:")
-    for k, v in metadata.items():
-        print(f"  {k}: {v}")
-    print()
+    if config.has_option('Data', 'inter_location_table'):
+        params['inter_location_table'] = config.get('Data', 'inter_location_table')
     
-    # 设置随机种子
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(args.seed)
-        print(f"✅ 随机种子: {args.seed}\n")
+    if config.has_option('Data', 'debug_csv'):
+        params['debug_csv'] = config.get('Data', 'debug_csv')
     
-    # 初始化日志
-    if args.log_file is None:
-        args.log_file = f"log/train_from_samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    if args.model_file is None:
-        args.model_file = f"saved_models/model_from_samples_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pth"
+    # Model
+    params['input_len'] = config.getint('Model', 'input_len', fallback=12)
+    params['output_len'] = config.getint('Model', 'output_len', fallback=12)
+    params['tem_patchsize'] = config.getint('Model', 'tem_patchsize')
+    params['tem_patchnum'] = config.getint('Model', 'tem_patchnum')
+    params['spa_patchsize'] = config.getint('Model', 'spa_patchsize')
+    params['spa_patchnum'] = config.getint('Model', 'spa_patchnum')
+    params['layers'] = config.getint('Model', 'layers')
+    params['factors'] = config.getint('Model', 'factors')
+    params['input_dims'] = config.getint('Model', 'input_dims')
+    params['node_dims'] = config.getint('Model', 'node_dims')
+    params['recurtimes'] = config.getint('Model', 'recurtimes')
     
-    os.makedirs('log', exist_ok=True)
-    os.makedirs('saved_models', exist_ok=True)
+    # Training
+    params['learning_rate'] = config.getfloat('Training', 'learning_rate')
+    params['weight_decay'] = config.getfloat('Training', 'weight_decay')
+    params['batch_size'] = config.getint('Training', 'batch_size')
+    params['max_epoch'] = config.getint('Training', 'max_epoch')
     
-    log = open(args.log_file, 'w')
-    log_string(log, f"训练开始: {datetime.now()}")
+    # Log
+    params['log_file'] = config.get('Log', 'log_file')
+    params['model_file'] = config.get('Log', 'model_file')
     
-    # 初始化 ODPS 客户端
-    print("🔗 连接 ODPS...")
-    access_id = os.getenv('ALIBABA_CLOUD_ACCESS_KEY_ID')
-    access_key = os.getenv('ALIBABA_CLOUD_ACCESS_KEY_SECRET')
-    
-    if not access_id or not access_key:
-        raise ValueError("请设置环境变量: ALIBABA_CLOUD_ACCESS_KEY_ID 和 ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-    
-    odps_client = ODPS(access_id, access_key, args.odps_project, endpoint=args.odps_endpoint)
-    print("✅ ODPS 连接成功\n")
-    
-    # 加载数据（极快！直接读取已处理样本）
-    print("=" * 80)
-    print("加载数据")
-    print("=" * 80)
-    
-    trainX, trainY, trainXTE, trainYTE = load_samples_from_odps(
-        odps_client, args.sample_table, 'train', metadata
-    )
-    valX, valY, valXTE, valYTE = load_samples_from_odps(
-        odps_client, args.sample_table, 'val', metadata
-    )
-    testX, testY, testXTE, testYTE = load_samples_from_odps(
-        odps_client, args.sample_table, 'test', metadata
-    )
-    
-    mean = metadata['mean']
-    std = metadata['std']
-    node_num = metadata['node_num']
-    
-    print(f"\n✅ 数据加载完成！")
-    print(f"  训练集: {trainX.shape[0]} 样本")
-    print(f"  验证集: {valX.shape[0]} 样本")
-    print(f"  测试集: {testX.shape[0]} 样本")
-    print(f"  节点数: {node_num}")
-    print()
-    
-    # 构建模型
-    print("=" * 80)
-    print("构建模型")
-    print("=" * 80)
-    
-    device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
-    print(f"设备: {device}")
-    
-    # 注意：这里简化了 patch 索引，实际应从元数据加载
-    # 为简化，这里假设使用顺序索引
-    ori_parts_idx = list(range(node_num))
-    reo_parts_idx = list(range(node_num))
-    reo_all_idx = list(range(node_num))
-    
-    model = PatchSTG(
-        args.output_len if hasattr(args, 'output_len') else metadata['output_len'],
-        args.tem_patchsize,
-        args.tem_patchnum,
-        node_num,
-        args.spa_patchsize,
-        args.spa_patchnum,
-        args.tod,
-        args.dow,
-        args.layers,
-        args.factors,
-        args.input_dims,
-        args.node_dims,
-        args.tod_dims,
-        args.dow_dims,
-        ori_parts_idx,
-        reo_parts_idx,
-        reo_all_idx
-    ).to(device)
-    
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数: {total_params:,}\n")
-    
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
-    
-    lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer,
-        milestones=[1, 35, 40],
-        gamma=0.5,
-    )
-    
-    # 开始训练
-    print("=" * 80)
-    print("开始训练")
-    print("=" * 80)
-    print(f"Batch Size: {args.batch_size}")
-    print(f"Max Epochs: {args.max_epoch}")
-    print("=" * 80)
-    print()
-    
-    min_val_loss = float('inf')
-    best_epoch = 0
-    num_train = trainX.shape[0]
-    
-    for epoch in range(1, args.max_epoch + 1):
-        epoch_start_time = time.time()
-        model.train()
-        train_loss_sum = 0.0
-        batch_count = 0
-        
-        # 打乱训练数据
-        indices = np.random.permutation(num_train)
-        trainX = trainX[indices]
-        trainY = trainY[indices]
-        trainXTE = trainXTE[indices]
-        
-        num_batch = math.ceil(num_train / args.batch_size)
-        
-        pbar = tqdm(range(num_batch), desc=f"Epoch {epoch}/{args.max_epoch}")
-        
-        for batch_idx in pbar:
-            start_idx = batch_idx * args.batch_size
-            end_idx = min(num_train, (batch_idx + 1) * args.batch_size)
-
-            X = trainX[start_idx:end_idx]
-            Y = trainY[start_idx:end_idx]
-            TE = torch.from_numpy(trainXTE[start_idx:end_idx]).to(device)
-            NormX = torch.from_numpy((X - mean) / std).float().to(device)
-            Y_tensor = torch.from_numpy(Y).float().to(device)
-            
-            optimizer.zero_grad()
-            y_hat = model(NormX, TE)
-            loss = _compute_loss(Y_tensor, y_hat * std + mean)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5)
-            optimizer.step()
-            
-            train_loss_sum += loss.cpu().item()
-            batch_count += 1
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-        
-        avg_train_loss = train_loss_sum / batch_count
-        
-        # 验证
-        maes, rmses, mapes = validate(
-            model, valX, valY, valXTE, mean, std, device, args.batch_size
-        )
-        
-        val_mae = maes[-1]
-        
-        print(f"\nEpoch {epoch}:")
-        print(f"  训练损失: {avg_train_loss:.4f}")
-        print(f"  验证 MAE: {val_mae:.4f}")
-        print(f"  用时: {time.time() - epoch_start_time:.1f}s")
-        
-        log_string(log, f"Epoch {epoch}: Train Loss={avg_train_loss:.4f}, Val MAE={val_mae:.4f}")
-        
-        lr_scheduler.step()
-        
-        if val_mae < min_val_loss:
-            min_val_loss = val_mae
-            best_epoch = epoch
-            torch.save(model.state_dict(), args.model_file)
-            print(f"  ✅ 保存最佳模型")
-        print()
-    
-    # 测试
-    print("=" * 80)
-    print("测试集评估")
-    print("=" * 80)
-    
-    model.load_state_dict(torch.load(args.model_file))
-    maes, rmses, mapes = validate(
-        model, testX, testY, testXTE, mean, std, device, args.batch_size
-    )
-    
-    print(f"\n最终测试结果:")
-    print(f"  MAE:  {maes[-1]:.4f}")
-    print(f"  RMSE: {rmses[-1]:.4f}")
-    print(f"  MAPE: {mapes[-1]:.4f}")
-    
-    log.close()
-    
-    print("\n🎉 训练完成！")
-    print(f"最佳 Epoch: {best_epoch}")
-    print(f"模型: {args.model_file}")
-    print(f"日志: {args.log_file}")
+    return params
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True, help='配置文件路径')
+    parser.add_argument('--cuda', type=int, default=0, help='GPU 设备编号')
+    parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='运行模式')
+    
+    args = parser.parse_args()
+    
+    # 解析配置
+    config = parse_config(args.config)
+    config['cuda'] = args.cuda
+    
+    # 创建 Solver
+    solver = SampleSolver(config)
+    
+    # 运行
+    if args.mode == 'train':
+        solver.train()
+        solver.test()
+    else:
+        solver.test()
+    
+    log.close()
