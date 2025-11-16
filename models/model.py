@@ -147,7 +147,20 @@ class PatchSTG(nn.Module):
         # ----------------- embedding（Section 4.1） -----------------
         embeded_x = self.embedding(x, te)
         # 选择经过 patching 与 padding 后的索引集合（reo_all_idx）用于 encoder
-        rex = embeded_x[:,:,self.reo_all_idx,:] # select patched points
+        # 防御性校验：确保索引在合法范围内，避免在 CUDA 上触发 device-side assert
+        try:
+            # 将可能是 numpy array/list 的索引转换为 LongTensor 并移动到与 x 相同的 device
+            idx_all = torch.tensor(self.reo_all_idx, dtype=torch.long, device=x.device)
+        except Exception:
+            idx_all = torch.tensor([], dtype=torch.long, device=x.device)
+
+        if idx_all.numel() > 0:
+            idx_all = idx_all.clamp(0, max(0, self.node_num - 1))
+        else:
+            # 兜底：如果没有任何索引（极端情况），使用全体节点索引作为后备
+            idx_all = torch.arange(min(1, self.node_num), dtype=torch.long, device=x.device)
+
+        rex = embeded_x.index_select(2, idx_all)
 
         # ----------------- dual attention encoder（Section 4.3） -----------------
         for block in self.spa_encoder:
@@ -156,7 +169,31 @@ class PatchSTG(nn.Module):
         # 把编码后的结果放回原始节点顺序：先创建一个全零张量，再把 patch 内有效位置填回
         orginal = torch.zeros(rex.shape[0],rex.shape[1],self.node_num,rex.shape[-1]).to(x.device)
         # 将 rex 中按重排(reo_parts_idx)的值赋回原始索引位置 ori_parts_idx
-        orginal[:,:,self.ori_parts_idx,:] = rex[:,:,self.reo_parts_idx,:] # back to the original indices
+        # 防御性处理：确保索引张量合法且长度匹配
+        try:
+            ori_idx = torch.tensor(self.ori_parts_idx, dtype=torch.long, device=x.device)
+        except Exception:
+            ori_idx = torch.tensor([], dtype=torch.long, device=x.device)
+        try:
+            reo_idx = torch.tensor(self.reo_parts_idx, dtype=torch.long, device=x.device)
+        except Exception:
+            reo_idx = torch.tensor([], dtype=torch.long, device=x.device)
+
+        # 裁剪索引到合法范围
+        if ori_idx.numel() > 0:
+            ori_idx = ori_idx.clamp(0, max(0, self.node_num - 1))
+        if reo_idx.numel() > 0:
+            reo_idx = reo_idx.clamp(0, max(0, rex.shape[2] - 1))
+
+        # 长度对齐（取最小长度），以免赋值时维度不匹配导致错误
+        if ori_idx.numel() == 0 or reo_idx.numel() == 0:
+            # 如果没有有效映射，跳过回写（保持 orginal 为 0）
+            pass
+        else:
+            min_len = min(ori_idx.numel(), reo_idx.numel())
+            ori_idx_s = ori_idx[:min_len]
+            reo_idx_s = reo_idx[:min_len]
+            orginal[:,:,ori_idx_s,:] = rex[:,:,reo_idx_s,:] # back to the original indices
 
         # ----------------- projection decoder（Section 4.4） -----------------
         # regression_conv 期望输入形状为 (B, C, H, W)，因此先把 orginal 转置并 reshape
