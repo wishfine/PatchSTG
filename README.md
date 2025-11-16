@@ -142,11 +142,12 @@ python check_odps_data.py --config config/ODPS.conf
 
 5. **Start training**:
 ```bash
-# Using Jupyter Notebooks (recommended for interactive debugging)
+# Legacy demo: Jupyter / simple ODPS script
 jupyter notebook train_model.ipynb
-
-# Or use Python script
 python train_odps.py --config config/ODPS.conf --mode both
+
+# New (this repo): MaxCompute 样本表流式训练入口
+python train_stream_from_samples.py --config config/samples.conf --cuda 0
 ```
 
 #### Features
