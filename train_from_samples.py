@@ -90,7 +90,7 @@ class SampleSolver(object):
     
     def load_sample_data(self):
         """
-        使用 PatchSTGSampleLoader 加载样本数据
+        使用 PatchSTGSampleLoader 预加载一部分样本数据（小规模调试用）
         """
         log_string(log, "======================LOADING DATA======================")
         
