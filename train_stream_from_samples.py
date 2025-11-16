@@ -212,29 +212,85 @@ class StreamSampleSolver(object):
         self.std = (1 - alpha) * self.std + alpha * max(batch_std, 1e-6)
 
     def _build_batch_from_records(self, records):
-        """将若干 SampleRecord 构建为 batch 的 X, Y, TE（TE 仅用前 2 维）。"""
-        B = len(records)
+        """将若干 SampleRecord 构建为 batch 的 X, Y, TE（TE 仅用前 2 维）。
+
+        适配样本表中每个 anchor_minute 节点数 node_count 不固定的情况：
+        - 所有样本在这里被统一到固定节点数 self.node_num；
+        - 如果某条样本的节点数 > self.node_num，则只取前 self.node_num 个节点；
+        - 如果某条样本的节点数 < self.node_num，则用 0 padding 补齐；
+        - 若时间步数与 input_len/output_len 不一致，或时间特征不足 input_len 步，则跳过该样本。
+        """
+        B_raw = len(records)
         input_len = self.input_len
         output_len = self.output_len
         N = self.node_num
 
-        X = np.zeros((B, input_len, N, 1), dtype=np.float32)
-        Y = np.zeros((B, output_len, N, 1), dtype=np.float32)
-        TE = np.zeros((B, input_len, N, 2), dtype=np.float32)
+        # 先按最大可能的 batch 大小分配，后面根据 valid_idx 进行截断
+        X = np.zeros((B_raw, input_len, N, 1), dtype=np.float32)
+        Y = np.zeros((B_raw, output_len, N, 1), dtype=np.float32)
+        TE = np.zeros((B_raw, input_len, N, 2), dtype=np.float32)
 
-        for i, rec in enumerate(records):
-            x_mat = rec.input_flows.astype(np.float32)
-            y_mat = rec.output_flows.astype(np.float32)
+        valid_idx = 0
+        skipped = 0
 
-            # 时间特征：取前 input_len 步、前 2 维 (week, hour)
-            te_all = rec.time_features[:input_len, :]
-            te_2 = te_all[:, :2].astype(np.float32)
+        for rec in records:
+            x_mat = rec.input_flows.astype(np.float32)   # (Tx, Nx)
+            y_mat = rec.output_flows.astype(np.float32)  # (Ty, Ny)
+            Tx, Nx = x_mat.shape
+            Ty, Ny = y_mat.shape
 
-            X[i, :, : x_mat.shape[1], 0] = x_mat
-            Y[i, :, : y_mat.shape[1], 0] = y_mat
+            # 时间步数不符合预期，跳过
+            if Tx != input_len or Ty != output_len:
+                skipped += 1
+                continue
 
-            TE[i] = np.repeat(te_2[:, np.newaxis, :], repeats=N, axis=1)
+            # 时间特征：至少需要 input_len 行
+            te_all = rec.time_features
+            if te_all.shape[0] < input_len:
+                skipped += 1
+                continue
 
+            # 仅使用前 input_len 步、前 2 维 (week, hour)
+            te_2 = te_all[:input_len, :2].astype(np.float32)  # (input_len, 2)
+
+            # 当前样本的有效节点数（取 input/output 的最小值）
+            node_cnt = min(Nx, Ny)
+
+            # 构造固定节点数 N 的中间矩阵，并做截断/补零
+            x_fixed = np.zeros((input_len, N), dtype=np.float32)
+            y_fixed = np.zeros((output_len, N), dtype=np.float32)
+
+            use_n = min(node_cnt, N)
+            if use_n > 0:
+                x_fixed[:, :use_n] = x_mat[:, :use_n]
+                y_fixed[:, :use_n] = y_mat[:, :use_n]
+
+            # 写入 batch
+            X[valid_idx, :, :, 0] = x_fixed
+            Y[valid_idx, :, :, 0] = y_fixed
+
+            # 时间特征：对所有节点重复同一组 TE
+            TE[valid_idx] = np.repeat(te_2[:, np.newaxis, :], repeats=N, axis=1)
+
+            valid_idx += 1
+
+        if valid_idx == 0:
+            # 全部样本都被跳过，说明这一批数据全是异常形状，直接报错更清晰
+            raise RuntimeError(
+                f"_build_batch_from_records: 所有 {B_raw} 条样本因形状或时间特征异常被跳过, "
+                f"input_len={input_len}, output_len={output_len}, node_num={N}"
+            )
+
+        if skipped > 0:
+            log_string(
+                log,
+                f"_build_batch_from_records: 跳过 {skipped}/{B_raw} 条形状异常样本, 实际有效样本数={valid_idx}",
+            )
+
+        # 截取前 valid_idx 条作为最终 batch
+        X = X[:valid_idx]
+        Y = Y[:valid_idx]
+        TE = TE[:valid_idx]
         return X, Y, TE
 
     # -------------------- 训练循环（流式） --------------------
