@@ -201,19 +201,35 @@ class PatchSTGSampleLoader:
         if not self._samples:
             raise RuntimeError("尚未加载任何样本，请先调用 load_from_odps/load_from_csv 等方法。")
 
-        input_len = self._samples[0].input_flows.shape[0]
-        output_len = self._samples[0].output_flows.shape[0]
-        node_num = self._samples[0].input_flows.shape[1]
-        time_feat_dim = self._samples[0].time_features.shape[1]
+        # 以第一条样本为“模板”，其他样本如果长度或节点数不一致，就跳过
+        ref = self._samples[0]
+        input_len = ref.input_flows.shape[0]
+        output_len = ref.output_flows.shape[0]
+        node_num = ref.input_flows.shape[1]
+        time_feat_dim = ref.time_features.shape[1]
 
-        num_samples = len(self._samples)
+        valid_samples: List[SampleRecord] = []
+        for s in self._samples:
+            if (
+                s.input_flows.shape[0] == input_len
+                and s.output_flows.shape[0] == output_len
+                and s.input_flows.shape[1] == node_num
+                and s.output_flows.shape[1] == node_num
+                and s.time_features.shape[0] >= input_len
+            ):
+                valid_samples.append(s)
 
-        X = np.stack([s.input_flows for s in self._samples], axis=0)  # (N, input_len, node_num)
-        Y = np.stack([s.output_flows for s in self._samples], axis=0) # (N, output_len, node_num)
+        if not valid_samples:
+            raise RuntimeError("prepare_training_data: 所有样本的形状都与第一条不一致，无法构建训练数据")
+
+        num_samples = len(valid_samples)
+
+        X = np.stack([s.input_flows for s in valid_samples], axis=0)  # (N, input_len, node_num)
+        Y = np.stack([s.output_flows for s in valid_samples], axis=0) # (N, output_len, node_num)
 
         # 只取前 input_len 步作为 X 的时间特征
         TE = np.stack(
-            [s.time_features[:input_len] for s in self._samples],
+            [s.time_features[:input_len] for s in valid_samples],
             axis=0,
         )  # (N, input_len, time_feat_dim)
 
@@ -224,8 +240,8 @@ class PatchSTGSampleLoader:
         # 时间特征扩展到 (N, T, N_nodes, time_feat_dim)
         TE = np.repeat(TE[:, :, np.newaxis, :], repeats=node_num, axis=2).astype(np.float32)
 
-        # 统一 node_pairs
-        node_pairs = self._samples[0].node_pairs  # (node_num, 2)
+    # 统一 node_pairs（按模板样本）
+    node_pairs = ref.node_pairs  # (node_num, 2)
 
         # 计算 mean/std（或者使用样本里的 flow_mean / flow_std）
         if normalize:
@@ -233,8 +249,8 @@ class PatchSTGSampleLoader:
             std = float(np.std(X) + 1e-6)
         else:
             # 如果每条样本的 mean/std 一致，可以直接取第一条
-            mean = float(self._samples[0].flow_mean)
-            std = float(self._samples[0].flow_std)
+            mean = float(ref.flow_mean)
+            std = float(ref.flow_std)
 
         # 划分 train/val/test
         n_train = int(num_samples * self.train_ratio)
