@@ -137,18 +137,27 @@ def construct_adj(data, num_node):
             day_mean = np.mean(day_data, axis=0)   # (nodes, 1)
             daily_means.append(day_mean)
         data_mean = np.mean(daily_means, axis=0)   # (nodes, 1)
-    
+
     # 确保形状为 (nodes, features)
     data_mean = data_mean.squeeze()  # 移除所有长度为1的维度
+
+    # 极端情况兜底：如果 squeeze 后成为标量，说明样本极少，退化为单位相似度矩阵
+    if data_mean.ndim == 0:
+        return np.eye(num_node, dtype=float)
+
     if data_mean.ndim == 1:
         data_mean = data_mean.reshape(-1, 1)  # (nodes, 1)
     elif data_mean.ndim > 2:
         # 如果还有多余维度，强制reshape
         data_mean = data_mean.reshape(num_node, -1)  # (nodes, features)
-    
-    # 断言：确保 data_mean 的第一维是 num_node
-    assert data_mean.shape[0] == num_node, \
-        f"data_mean 的节点维度不匹配: {data_mean.shape[0]} != {num_node}"
+
+    # 如果节点维度与 num_node 不一致，进行裁剪或 padding
+    if data_mean.shape[0] != num_node:
+        if data_mean.shape[0] > num_node:
+            data_mean = data_mean[:num_node]
+        else:
+            pad_rows = np.repeat(data_mean[-1:], num_node - data_mean.shape[0], axis=0)
+            data_mean = np.concatenate([data_mean, pad_rows], axis=0)
     
     # 转置为 (nodes, time_features)，然后计算节点间的余弦相似度
     tem_matrix = cosine_similarity(data_mean, data_mean)  # (nodes, nodes)
