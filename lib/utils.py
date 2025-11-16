@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 import torch
 import numpy as np
 import pandas as pd
@@ -6,11 +8,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 # 工具模块：包含日志、评估指标、数据变换与分区/重排等函数
 
-# 写日志并同时打印到 stdout，确保日志文件实时刷新
+# 写日志并同时打印到 stdout，确保日志文件实时刷新，并带上时间戳
 def log_string(log, string):
-    log.write(string + '\n')
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    formatted = f"[{timestamp}] {string}"
+    log.write(formatted + '\n')
     log.flush()
-    print(string)
+    print(formatted)
 
 
 # 计算评估指标（针对 numpy 数组）

@@ -419,15 +419,21 @@ def parse_config(config_file):
     return params
 
 
+DEFAULT_CONFIG_PATH = os.path.join('config', 'samples.conf')
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, required=True, help='配置文件路径')
+    parser.add_argument('--config', type=str, default=DEFAULT_CONFIG_PATH, help='配置文件路径，默认 config/samples.conf')
     parser.add_argument('--cuda', type=int, default=0, help='GPU 设备编号')
     parser.add_argument('--mode', type=str, default='train', choices=['train', 'test'], help='运行模式')
     
     args = parser.parse_args()
     
     # 解析配置
+    if not os.path.exists(args.config):
+        raise FileNotFoundError(f"找不到配置文件: {args.config}，如需自定义请使用 --config 指定")
+
     config = parse_config(args.config)
     config['cuda'] = args.cuda
     
