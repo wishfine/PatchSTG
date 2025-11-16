@@ -296,3 +296,60 @@ def loadData(filepath, metapath, P, Q, train_ratio, test_ratio, adjpath, recurti
     
     return trainX, trainY, trainXTE, trainYTE, valX, valY, valXTE, valYTE, testX, testY, testXTE, testYTE, mean, std, ori_parts_idx, reo_parts_idx, reo_all_idx
     
+
+def loadDataFromSamples(sample_data_dict, locations, adjpath, recurtimes, sps, log):
+    """从 PatchSTGSampleLoader 预处理的样本数据中构建训练/验证/测试集"""
+
+    trainX = sample_data_dict['train']['X']
+    trainY = sample_data_dict['train']['Y']
+    trainTE = sample_data_dict['train']['TE']
+
+    valX = sample_data_dict['val']['X']
+    valY = sample_data_dict['val']['Y']
+    valTE = sample_data_dict['val']['TE']
+
+    testX = sample_data_dict['test']['X']
+    testY = sample_data_dict['test']['Y']
+    testTE = sample_data_dict['test']['TE']
+
+    metadata = sample_data_dict['metadata']
+    mean = metadata['mean']
+    std = metadata['std']
+    num_node = trainX.shape[2]
+
+    log_string(log, f'Shape of trainX: {trainX.shape}')
+    log_string(log, f'Shape of trainTE: {trainTE.shape}')
+    log_string(log, f'Shape of locations: {locations.shape}')
+    log_string(log, f'Number of nodes: {num_node}')
+    log_string(log, f'Mean: {mean} & Std: {std}')
+
+    if os.path.exists(adjpath):
+        adj = np.load(adjpath)
+        log_string(log, f'Loaded adj matrix from {adjpath}')
+    else:
+        train_data_for_adj = trainX.transpose(1, 0, 2, 3).reshape(-1, num_node, 1)
+        adj = construct_adj(train_data_for_adj, num_node)
+        np.save(adjpath, adj)
+        log_string(log, f'Constructed and saved adj matrix to {adjpath}')
+
+    if locations.shape[1] != num_node:
+        log_string(log, f'WARNING: locations维度({locations.shape[1]}) != num_node({num_node})')
+        log_string(log, f'使用前{num_node}个位置进行KDTree划分')
+        locations = locations[:, :num_node]
+
+    parts_idx, mxlen = kdTree(locations, recurtimes, 0)
+    ori_parts_idx, reo_parts_idx, reo_all_idx = reorderData(parts_idx, mxlen, adj, sps)
+
+    log_string(log, f'KDTree划分: {len(parts_idx)} 个patches, 最大长度={mxlen}')
+    log_string(log, f'Reordered indices: ori={len(ori_parts_idx)}, reo={len(reo_parts_idx)}, all={len(reo_all_idx)}')
+
+    trainYTE = trainTE.copy()
+    valYTE = valTE.copy()
+    testYTE = testTE.copy()
+
+    log_string(log, f'Shape of Train: {trainY.shape}')
+    log_string(log, f'Shape of Validation: {valY.shape}')
+    log_string(log, f'Shape of Test: {testY.shape}')
+
+    return trainX, trainY, trainTE, trainYTE, valX, valY, valTE, valYTE, testX, testY, testTE, testYTE, mean, std, ori_parts_idx, reo_parts_idx, reo_all_idx
+
